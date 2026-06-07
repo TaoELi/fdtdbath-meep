@@ -1699,6 +1699,7 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
         Matrix,
         Medium,
         MultilevelAtom,
+        MXLSocketSusceptibility,
         NoisyDrudeSusceptibility,
         NoisyLorentzianSusceptibility,
         BathLorentzianSusceptibility,

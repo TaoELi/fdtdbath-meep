@@ -28,20 +28,25 @@ using namespace std;
 
 namespace meep {
 
+void report_mxl_socket_susceptibility_driver_count(field_type ft);
+
 void fields::update_pols(field_type ft) {
+  // First initialize all owned polarization states.  This lets
+  // MXLSocketSusceptibility print the total required driver count before any
+  // rank opens a socket connection.
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
-      if (chunks[i]->update_pols(ft)) {
+      if (chunks[i]->update_pols(ft, false)) {
         chunk_connections_valid = false;
         assert(changed_materials);
       }
+  report_mxl_socket_susceptibility_driver_count(ft);
+  for (int i = 0; i < num_chunks; i++)
+    if (chunks[i]->is_mine()) chunks[i]->update_pols(ft, true);
 }
 
-bool fields_chunk::update_pols(field_type ft) {
+bool fields_chunk::update_pols(field_type ft, bool update) {
   bool allocated_fields = false;
-
-  realnum *w[NUM_FIELD_COMPONENTS][2];
-  FOR_COMPONENTS(c) DOCMP2 { w[c][cmp] = f_w[c][cmp] ? f_w[c][cmp] : f[c][cmp]; }
 
   for (polarization_state *p = pol[ft]; p; p = p->next) {
 
@@ -53,7 +58,14 @@ bool fields_chunk::update_pols(field_type ft) {
         allocated_fields = true;
       }
     }
+  }
 
+  if (!update) return allocated_fields;
+
+  realnum *w[NUM_FIELD_COMPONENTS][2];
+  FOR_COMPONENTS(c) DOCMP2 { w[c][cmp] = f_w[c][cmp] ? f_w[c][cmp] : f[c][cmp]; }
+
+  for (polarization_state *p = pol[ft]; p; p = p->next) {
     // Finally, timestep the polarizations:
     p->s->update_P(w, f_w_prev, dt, gv, p->data);
   }

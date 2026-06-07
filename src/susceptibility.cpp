@@ -26,9 +26,17 @@
    array.  The meep::fields class is responsible for allocating P and
    sigma and passing them to susceptibility::update_P. */
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <numeric>
+#include <sstream>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+#include <unistd.h>
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include <iostream>
@@ -192,6 +200,352 @@ static bool lorentzian_unstable(realnum omega_0, realnum gamma, realnum dt) {
 // stable averaging of offdiagonal components
 #define OFFDIAG(u, g, sx, s)                                                                       \
   (0.25 * ((g[i] + g[i - sx]) * u[i] + (g[i + s] + g[(i + s) - sx]) * u[i + s]))
+
+namespace {
+
+const double mxl_fs_to_au = 41.341373335;
+const double mxl_efield_mu_to_au_prefactor = 1.2929541569381223e-6;
+const double mxl_source_amp_au_to_mu = 0.002209799779149953;
+const int mxl_molecules_per_chunk_id_block = 100000;
+const int mxl_chunks_per_rank_id_block = 100;
+const int mxl_max_molecule_id = 2147483647;
+
+/* These counters are reset whenever material susceptibilities are rebuilt. */
+int mxl_next_chunk_ordinal = 0;
+size_t mxl_local_active_site_count = 0;
+bool mxl_socket_susceptibility_present = false;
+bool mxl_driver_count_reported = false;
+
+static int mxl_dim_power(ndim dim) {
+  switch (dim) {
+    case D1: return 1;
+    case D2: return 2;
+    case D3: return 3;
+    case Dcyl: return 2;
+  }
+  return 3;
+}
+
+static int mxl_amp_axis(component c) {
+  switch (component_direction(c)) {
+    case X:
+    case R: return 0;
+    case Y:
+    case P: return 1;
+    case Z: return 2;
+    default: return 0;
+  }
+}
+
+static void mxl_assert_little_endian() {
+  const uint16_t x = 1;
+  if (*((const unsigned char *)&x) != 1)
+    meep::abort("MXLSocketSusceptibility requires a little-endian host.");
+}
+
+static void mxl_append_i32(std::vector<unsigned char> &buf, int value) {
+  uint32_t v = (uint32_t)value;
+  buf.push_back((unsigned char)(v & 0xffu));
+  buf.push_back((unsigned char)((v >> 8) & 0xffu));
+  buf.push_back((unsigned char)((v >> 16) & 0xffu));
+  buf.push_back((unsigned char)((v >> 24) & 0xffu));
+}
+
+static int mxl_read_i32(const unsigned char *p) {
+  uint32_t v = ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+               ((uint32_t)p[3] << 24);
+  return (int)v;
+}
+
+static void mxl_append_f64(std::vector<unsigned char> &buf, double value) {
+  unsigned char bytes[sizeof(double)];
+  memcpy(bytes, &value, sizeof(double));
+  buf.insert(buf.end(), bytes, bytes + sizeof(double));
+}
+
+static double mxl_read_f64(const unsigned char *p) {
+  double value;
+  memcpy(&value, p, sizeof(double));
+  return value;
+}
+
+/* Minimal TCP client for the aggregate MaxwellLink susceptibility protocol. */
+class mxl_socket_client {
+public:
+  mxl_socket_client() : fd(-1) {}
+  mxl_socket_client(const mxl_socket_client &) : fd(-1) {}
+  mxl_socket_client &operator=(const mxl_socket_client &) {
+    close();
+    fd = -1;
+    return *this;
+  }
+  ~mxl_socket_client() { close(); }
+
+  void ensure_connected(const std::string &host, int port, double timeout) {
+    if (fd >= 0) return;
+
+    std::ostringstream port_stream;
+    port_stream << port;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *result = NULL;
+    int rc = getaddrinfo(host.c_str(), port_stream.str().c_str(), &hints, &result);
+    if (rc != 0)
+      meep::abort("MXLSocketSusceptibility getaddrinfo(%s:%d) failed: %s", host.c_str(), port,
+                  gai_strerror(rc));
+
+    int connected_fd = -1;
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+      connected_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if (connected_fd < 0) continue;
+      set_timeout(connected_fd, timeout);
+      if (connect(connected_fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+      ::close(connected_fd);
+      connected_fd = -1;
+    }
+
+    freeaddrinfo(result);
+
+    if (connected_fd < 0)
+      meep::abort("MXLSocketSusceptibility failed to connect to MaxwellLink endpoint %s:%d",
+                  host.c_str(), port);
+    fd = connected_fd;
+  }
+
+  void send_init(const std::vector<int> &molecule_ids, double dt_au, double rescaling_factor,
+                 double time_units_fs, double timeout, int rank) {
+    std::ostringstream json;
+    json.precision(17);
+    json << "{\"protocol\":\"mxl_socket_susceptibility_v1\",";
+    json << "\"dt_au\":" << dt_au << ",";
+    json << "\"rank\":" << rank << ",";
+    json << "\"rescaling_factor\":" << rescaling_factor << ",";
+    json << "\"time_units_fs\":" << time_units_fs << ",";
+    json << "\"timeout\":" << timeout << ",";
+    json << "\"molecule_ids\":[";
+    for (size_t i = 0; i < molecule_ids.size(); ++i) {
+      if (i) json << ",";
+      json << molecule_ids[i];
+    }
+    json << "]}";
+
+    send_msg("MXLINIT");
+    send_bytes(json.str());
+    std::string ready = recv_msg();
+    if (ready != "MXLREADY")
+      meep::abort("MXLSocketSusceptibility expected MXLREADY after MXLINIT, got '%s'",
+                  ready.c_str());
+  }
+
+  void step(const std::vector<int> &molecule_ids, const std::vector<double> &efields_au,
+            std::vector<double> &amps_au) {
+    const size_t nreq = molecule_ids.size();
+    if (efields_au.size() != 3 * nreq)
+      meep::abort("MXLSocketSusceptibility internal efield array size mismatch.");
+
+    std::vector<unsigned char> frame;
+    frame.reserve(20 + 24 * nreq + 8 * nreq);
+    append_header(frame, "AGGSTEP");
+    mxl_append_i32(frame, (int)nreq);
+    mxl_append_i32(frame, (int)nreq);
+    for (size_t i = 0; i < nreq; ++i) {
+      mxl_append_f64(frame, efields_au[3 * i + 0]);
+      mxl_append_f64(frame, efields_au[3 * i + 1]);
+      mxl_append_f64(frame, efields_au[3 * i + 2]);
+    }
+    for (size_t i = 0; i < nreq; ++i) {
+      mxl_append_i32(frame, molecule_ids[i]);
+      mxl_append_i32(frame, (int)i);
+    }
+    send_all(frame.data(), frame.size());
+
+    std::vector<unsigned char> head(16);
+    recv_all(head.data(), head.size());
+    std::string header = parse_header(head.data());
+    if (header != "AGGRESULT")
+      meep::abort("MXLSocketSusceptibility expected AGGRESULT, got '%s'", header.c_str());
+
+    int nresp = mxl_read_i32(head.data() + 12);
+    if (nresp < 0) meep::abort("MXLSocketSusceptibility received negative response count.");
+
+    std::vector<unsigned char> fixed((size_t)nresp * 32);
+    if (!fixed.empty()) recv_all(fixed.data(), fixed.size());
+
+    amps_au.assign(3 * nreq, 0.0);
+    std::vector<char> seen(nreq, 0);
+    size_t total_extra = 0;
+    std::unordered_map<int, size_t> id_to_index;
+    for (size_t i = 0; i < nreq; ++i)
+      id_to_index[molecule_ids[i]] = i;
+
+    for (int j = 0; j < nresp; ++j) {
+      const unsigned char *rec = fixed.data() + (size_t)j * 32;
+      int mid = mxl_read_i32(rec);
+      std::unordered_map<int, size_t>::const_iterator it = id_to_index.find(mid);
+      if (it == id_to_index.end())
+        meep::abort("MXLSocketSusceptibility received response for unknown molecule_id %d", mid);
+      size_t idx = it->second;
+      amps_au[3 * idx + 0] = mxl_read_f64(rec + 4);
+      amps_au[3 * idx + 1] = mxl_read_f64(rec + 12);
+      amps_au[3 * idx + 2] = mxl_read_f64(rec + 20);
+      int extra_len = mxl_read_i32(rec + 28);
+      if (extra_len < 0)
+        meep::abort("MXLSocketSusceptibility received negative extra payload length.");
+      total_extra += (size_t)extra_len;
+      seen[idx] = 1;
+    }
+
+    if (total_extra) {
+      std::vector<unsigned char> extras(total_extra);
+      recv_all(extras.data(), extras.size());
+    }
+    for (size_t i = 0; i < nreq; ++i)
+      if (!seen[i])
+        meep::abort("MXLSocketSusceptibility missing response for molecule_id %d",
+                    molecule_ids[i]);
+  }
+
+private:
+  int fd;
+
+  static void set_timeout(int sockfd, double timeout) {
+    if (timeout <= 0) return;
+    struct timeval tv;
+    tv.tv_sec = (time_t)timeout;
+    tv.tv_usec = (suseconds_t)((timeout - tv.tv_sec) * 1000000.0);
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
+
+  void close() {
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+
+  static void append_header(std::vector<unsigned char> &buf, const char *msg) {
+    size_t len = strlen(msg);
+    if (len > 12) meep::abort("MXLSocketSusceptibility internal header too long.");
+    for (size_t i = 0; i < 12; ++i)
+      buf.push_back(i < len ? (unsigned char)msg[i] : (unsigned char)' ');
+  }
+
+  static std::string parse_header(const unsigned char *p) {
+    std::string s((const char *)p, 12);
+    while (!s.empty() && s[s.size() - 1] == ' ')
+      s.erase(s.size() - 1);
+    return s;
+  }
+
+  void send_msg(const char *msg) {
+    unsigned char hdr[12];
+    memset(hdr, ' ', sizeof(hdr));
+    size_t len = strlen(msg);
+    if (len > sizeof(hdr)) meep::abort("MXLSocketSusceptibility internal header too long.");
+    memcpy(hdr, msg, len);
+    send_all(hdr, sizeof(hdr));
+  }
+
+  std::string recv_msg() {
+    unsigned char hdr[12];
+    recv_all(hdr, sizeof(hdr));
+    return parse_header(hdr);
+  }
+
+  void send_bytes(const std::string &payload) {
+    std::vector<unsigned char> lenbuf;
+    mxl_append_i32(lenbuf, (int)payload.size());
+    send_all(lenbuf.data(), lenbuf.size());
+    if (!payload.empty()) send_all((const unsigned char *)payload.data(), payload.size());
+  }
+
+  void send_all(const unsigned char *buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+      ssize_t n = ::send(fd, buf + done, len - done, 0);
+      if (n <= 0)
+        meep::abort("MXLSocketSusceptibility socket send failed: %s", strerror(errno));
+      done += (size_t)n;
+    }
+  }
+
+  void recv_all(unsigned char *buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+      ssize_t n = ::recv(fd, buf + done, len - done, 0);
+      if (n <= 0)
+        meep::abort("MXLSocketSusceptibility socket receive failed: %s", strerror(errno));
+      done += (size_t)n;
+    }
+  }
+};
+
+/* Per-chunk state for the socket-backed polarization variables. */
+struct mxl_socket_data {
+  size_t ntot;
+  realnum *P[NUM_FIELD_COMPONENTS][2];
+  std::vector<realnum> P_store[NUM_FIELD_COMPONENTS][2];
+  std::vector<size_t> active_indices;
+  std::vector<int> molecule_ids;
+  std::vector<double> efields_au;
+  std::vector<double> amps_au;
+  bool initialized;
+  mxl_socket_client client;
+
+  mxl_socket_data() : ntot(0), initialized(false), client() {
+    FOR_COMPONENTS(c) DOCMP2 { P[c][cmp] = NULL; }
+  }
+
+  mxl_socket_data(const mxl_socket_data &other)
+      : ntot(other.ntot), active_indices(other.active_indices), molecule_ids(other.molecule_ids),
+        efields_au(other.efields_au), amps_au(other.amps_au), initialized(false), client() {
+    FOR_COMPONENTS(c) DOCMP2 { P_store[c][cmp] = other.P_store[c][cmp]; }
+    reset_ptrs();
+  }
+
+  void reset_ptrs() {
+    FOR_COMPONENTS(c) DOCMP2 {
+      P[c][cmp] = P_store[c][cmp].empty() ? NULL : P_store[c][cmp].data();
+    }
+  }
+};
+
+} // namespace
+
+void reset_mxl_socket_susceptibility_chunk_ordinals() {
+  mxl_next_chunk_ordinal = 0;
+  mxl_local_active_site_count = 0;
+  mxl_socket_susceptibility_present = false;
+  mxl_driver_count_reported = false;
+}
+
+void report_mxl_socket_susceptibility_driver_count(field_type ft) {
+  if (ft != E_stuff || mxl_driver_count_reported) return;
+
+  /* This is called after all owned chunks have initialized their susceptibility
+     data, but before any socket connection is opened. */
+  const bool present = or_to_all(mxl_socket_susceptibility_present);
+  if (!present) {
+    mxl_driver_count_reported = true;
+    return;
+  }
+
+  const size_t total_active_site_count = sum_to_all(mxl_local_active_site_count);
+  begin_critical_section(31415);
+  printf("MXLSocketSusceptibility rank %d: required socket drivers = %zu\n", my_rank(),
+         mxl_local_active_site_count);
+  fflush(stdout);
+  end_critical_section(31415);
+  all_wait();
+  master_printf("MXLSocketSusceptibility total required socket drivers = %zu\n",
+                total_active_site_count);
+  mxl_driver_count_reported = true;
+}
 
 void lorentzian_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
                                          realnum *W_prev[NUM_FIELD_COMPONENTS][2], realnum dt,
@@ -781,6 +1135,212 @@ void bath_lorentzian_susceptibility::dump_params(h5file *h5f, size_t *start) {
 
   // Clean up the dynamic array.
   delete[] params_data;
+}
+
+mxl_socket_susceptibility::mxl_socket_susceptibility(realnum rescaling_factor,
+                                                     realnum time_units_fs, realnum timeout,
+                                                     const char *host, int port)
+    : rescaling_factor(rescaling_factor), time_units_fs(time_units_fs), timeout(timeout),
+      host(host ? host : "127.0.0.1"), port(port) {
+  mxl_socket_susceptibility_present = true;
+  mxl_assert_little_endian();
+  if (rescaling_factor < 0.0)
+    meep::abort("MXLSocketSusceptibility rescaling_factor must be nonnegative.");
+  if (time_units_fs <= 0.0)
+    meep::abort("MXLSocketSusceptibility time_units_fs must be positive.");
+  if (timeout < 0.0) meep::abort("MXLSocketSusceptibility timeout must be nonnegative.");
+  if (this->host.empty()) meep::abort("MXLSocketSusceptibility host must be nonempty.");
+  if (port <= 0 || port > 65535)
+    meep::abort("MXLSocketSusceptibility port must be in the range [1, 65535].");
+}
+
+bool mxl_socket_susceptibility::needs_P(component c, int cmp,
+                                        realnum *W[NUM_FIELD_COMPONENTS][2]) const {
+  if (cmp != 0) return false;
+  if (!is_electric(c)) return false;
+  direction d = component_direction(c);
+  return !trivial_sigma[c][d] && W[c][cmp];
+}
+
+bool mxl_socket_susceptibility::needs_W_notowned(component c,
+                                                 realnum *W[NUM_FIELD_COMPONENTS][2]) const {
+  (void)c;
+  (void)W;
+  return false;
+}
+
+void *mxl_socket_susceptibility::new_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2],
+                                                   const grid_volume &gv) const {
+  (void)W;
+  (void)gv;
+  return new mxl_socket_data();
+}
+
+void mxl_socket_susceptibility::delete_internal_data(void *data) const {
+  delete (mxl_socket_data *)data;
+}
+
+void mxl_socket_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2],
+                                                   realnum dt, const grid_volume &gv,
+                                                   void *data) const {
+  (void)dt;
+  mxl_socket_data *d = (mxl_socket_data *)data;
+  if (gv.dim == Dcyl)
+    meep::abort("MXLSocketSusceptibility currently supports only Cartesian grids.");
+  d->ntot = gv.ntot();
+
+  FOR_COMPONENTS(c) DOCMP2 {
+    d->P_store[c][cmp].clear();
+    d->P[c][cmp] = NULL;
+    if (needs_P(c, cmp, W)) d->P_store[c][cmp].assign(d->ntot, 0.0);
+  }
+  d->reset_ptrs();
+
+  std::vector<char> active(d->ntot, 0);
+  /* The sigma arrays provide the material active-site mask here, not the
+     oscillator-strength semantics used by Lorentzian media. */
+  FOR_COMPONENTS(c) {
+    if (!is_electric(c) || !gv.has_field(c)) continue;
+    direction dc = component_direction(c);
+    const realnum *s = sigma[c][dc];
+    if (!s || !W[c][0]) continue;
+    PLOOP_OVER_VOL_OWNED(gv, c, i) {
+      if (s[i] != 0.0) active[(size_t)i] = 1;
+    }
+  }
+
+  d->active_indices.clear();
+  for (size_t i = 0; i < active.size(); ++i)
+    if (active[i]) d->active_indices.push_back(i);
+
+  if (d->active_indices.size() >= (size_t)mxl_molecules_per_chunk_id_block)
+    meep::abort("MXLSocketSusceptibility active site count %zu exceeds per-chunk id block %d.",
+                d->active_indices.size(), mxl_molecules_per_chunk_id_block);
+
+  /* Rank/chunk id blocks keep molecule ids deterministic for a fixed chunk
+     decomposition. */
+  int chunk_ordinal = mxl_next_chunk_ordinal++;
+  if (chunk_ordinal >= mxl_chunks_per_rank_id_block)
+    meep::abort("MXLSocketSusceptibility rank %d has too many internal chunks (%d >= %d).",
+                my_rank(), chunk_ordinal + 1, mxl_chunks_per_rank_id_block);
+
+  const long long rank_chunk =
+      ((long long)my_rank()) * mxl_chunks_per_rank_id_block + chunk_ordinal;
+  const long long base_id_long = rank_chunk * mxl_molecules_per_chunk_id_block;
+  if (base_id_long + (long long)d->active_indices.size() > mxl_max_molecule_id)
+    meep::abort("MXLSocketSusceptibility molecule ids exceed the int32 protocol range.");
+
+  int base_id = (int)base_id_long;
+  d->molecule_ids.resize(d->active_indices.size());
+  for (size_t i = 0; i < d->molecule_ids.size(); ++i)
+    d->molecule_ids[i] = base_id + (int)i;
+
+  mxl_local_active_site_count += d->active_indices.size();
+
+  d->efields_au.assign(3 * d->active_indices.size(), 0.0);
+  d->amps_au.assign(3 * d->active_indices.size(), 0.0);
+  d->initialized = false;
+}
+
+void *mxl_socket_susceptibility::copy_internal_data(void *data) const {
+  mxl_socket_data *d = (mxl_socket_data *)data;
+  if (!d) return NULL;
+  return new mxl_socket_data(*d);
+}
+
+void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
+                                         realnum *W_prev[NUM_FIELD_COMPONENTS][2], realnum dt,
+                                         const grid_volume &gv, void *P_internal_data) const {
+  (void)W_prev;
+  mxl_socket_data *d = (mxl_socket_data *)P_internal_data;
+  if (!d || d->active_indices.empty() || rescaling_factor == 0.0) return;
+
+  const double efield_factor = mxl_efield_mu_to_au_prefactor / (time_units_fs * time_units_fs);
+  const size_t n = d->active_indices.size();
+
+  component comps[3] = {Ex, Ey, Ez};
+  for (size_t imol = 0; imol < n; ++imol) {
+    size_t idx = d->active_indices[imol];
+    for (int axis = 0; axis < 3; ++axis) {
+      component c = comps[axis];
+      d->efields_au[3 * imol + axis] = W[c][0] ? efield_factor * W[c][0][idx] : 0.0;
+    }
+  }
+
+  d->client.ensure_connected(host, port, timeout);
+  if (!d->initialized) {
+    double dt_au = dt * time_units_fs * mxl_fs_to_au;
+    d->client.send_init(d->molecule_ids, dt_au, rescaling_factor, time_units_fs, timeout,
+                        my_rank());
+    d->initialized = true;
+  }
+  d->client.step(d->molecule_ids, d->efields_au, d->amps_au);
+
+  const int dim_power = mxl_dim_power(gv.dim);
+  double cell_measure = 1.0;
+  for (int i = 0; i < dim_power; ++i)
+    cell_measure *= gv.inva;
+  /* Convert molecular dmu/dt into a polarization-density increment. */
+  const double pdot_scale = mxl_source_amp_au_to_mu * rescaling_factor / cell_measure;
+
+  FOR_COMPONENTS(c) {
+    if (!is_electric(c) || !gv.has_field(c)) continue;
+    realnum *p = d->P[c][0];
+    if (!p) continue;
+    direction dc = component_direction(c);
+    const realnum *s = sigma[c][dc];
+    if (!s) continue;
+    int axis = mxl_amp_axis(c);
+    for (size_t imol = 0; imol < n; ++imol) {
+      size_t idx = d->active_indices[imol];
+      if (s[idx] != 0.0)
+        p[idx] += (realnum)(dt * pdot_scale * s[idx] * d->amps_au[3 * imol + axis]);
+    }
+  }
+}
+
+void mxl_socket_susceptibility::subtract_P(field_type ft,
+                                           realnum *f_minus_p[NUM_FIELD_COMPONENTS][2],
+                                           void *P_internal_data) const {
+  mxl_socket_data *d = (mxl_socket_data *)P_internal_data;
+  if (!d) return;
+  field_type ft2 = ft == E_stuff ? D_stuff : B_stuff;
+  FOR_FT_COMPONENTS(ft, ec) DOCMP2 {
+    if (d->P[ec][cmp]) {
+      component dc = field_type_component(ft2, ec);
+      if (f_minus_p[dc][cmp]) {
+        realnum *p = d->P[ec][cmp];
+        realnum *fmp = f_minus_p[dc][cmp];
+        for (size_t i = 0; i < d->ntot; ++i)
+          fmp[i] -= p[i];
+      }
+    }
+  }
+}
+
+int mxl_socket_susceptibility::num_cinternal_notowned_needed(component c,
+                                                             void *P_internal_data) const {
+  mxl_socket_data *d = (mxl_socket_data *)P_internal_data;
+  return d && d->P[c][0] ? 1 : 0;
+}
+
+realnum *mxl_socket_susceptibility::cinternal_notowned_ptr(int inotowned, component c, int cmp,
+                                                           int n, void *P_internal_data) const {
+  (void)inotowned;
+  mxl_socket_data *d = (mxl_socket_data *)P_internal_data;
+  if (!d || !d->P[c][cmp]) return NULL;
+  return d->P[c][cmp] + n;
+}
+
+void mxl_socket_susceptibility::dump_params(h5file *h5f, size_t *start) {
+  (void)h5f;
+  (void)start;
+  meep::abort("HDF5 dumping of MXLSocketSusceptibility is not supported.");
+}
+
+int mxl_socket_susceptibility::get_num_params() {
+  meep::abort("HDF5 dumping of MXLSocketSusceptibility is not supported.");
+  return 0;
 }
 
 gyrotropic_susceptibility::gyrotropic_susceptibility(const vec &bias, realnum omega_0,

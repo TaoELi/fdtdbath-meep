@@ -21,6 +21,7 @@
 /* the void *data field in geometric_object_struct points to   */
 /* a material_data structure, defined below.                   */
 /***************************************************************/
+#include <string>
 #include <vector>
 
 #include <meep.hpp>
@@ -66,6 +67,14 @@ typedef struct susceptibility_struct {
   std::vector<double> bath_couplings;
   std::vector<double> bath_gammas;
   std::vector<double> bath_anharmonicities;
+
+  /* MXLSocketSusceptibility parameters; ignored by ordinary susceptibilities. */
+  bool is_mxl_socket;
+  double mxl_rescaling_factor;
+  double mxl_time_units_fs;
+  double mxl_timeout;
+  std::string mxl_host;
+  int mxl_port;
 } susceptibility;
 
 using susceptibility_list = std::vector<susceptibility>;

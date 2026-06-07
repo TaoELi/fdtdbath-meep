@@ -1067,6 +1067,81 @@ class BathLorentzianSusceptibility(LorentzianSusceptibility):
         energy = 0.5 * rho * np.einsum("i,i...->...", bath_omega**2, bath_array[indexes]**2)
         return energy
 
+
+class MXLSocketSusceptibility(Susceptibility):
+    """
+    Specifies a socket-backed MaxwellLink molecular susceptibility.
+
+    This C-level susceptibility sends the local Meep electric field at each
+    active grid point to a MaxwellLink socket endpoint and deposits the returned
+    molecular `dmu/dt` as a polarization-density update. The endpoint is
+    normally supplied as a MaxwellLink hub object. The geometry region is
+    selected through normal Meep material assignment; this class intentionally
+    does not expose a public `sigma` parameter.
+    """
+
+    def __init__(
+        self,
+        rescaling_factor=1.0,
+        time_units_fs=0.1,
+        hub=None,
+        timeout=None,
+        host=None,
+        port=None,
+    ):
+        """
+        + **`rescaling_factor` [`number`]** — The effective number of physical
+          molecules represented by one socket molecule at each active grid point.
+
+        + **`time_units_fs` [`number`]** — The number of femtoseconds represented
+          by one Meep time unit.
+
+        + **`hub`** — Optional MaxwellLink susceptibility socket hub. If omitted,
+          the explicit `host`, `port`, and `timeout` values are used.
+
+        + **`timeout` [`number`]** — Socket timeout in seconds.
+
+        + **`host` [`string`]** — MaxwellLink hub host name or IP address.
+
+        + **`port` [`integer`]** — MaxwellLink hub TCP port.
+
+        The usual Meep material geometry selects active grid points. This
+        susceptibility does not expose a public `sigma` argument.
+        """
+        # The scalar sigma marks material pixels as active for the C++ socket
+        # susceptibility; it is not a Lorentzian oscillator strength.
+        super().__init__(sigma=1.0)
+        host, port, timeout = self._resolve_hub_endpoint(hub, host, port, timeout)
+        check_nonnegative("rescaling_factor", rescaling_factor)
+        check_nonnegative("timeout", timeout)
+        if time_units_fs <= 0:
+            raise ValueError("time_units_fs must be positive.")
+        if not isinstance(host, str) or not host:
+            raise ValueError("host must be a nonempty string.")
+        if port <= 0 or port > 65535:
+            raise ValueError("port must be in the range [1, 65535].")
+        self.rescaling_factor = rescaling_factor
+        self.time_units_fs = time_units_fs
+        self.timeout = timeout
+        self.host = host
+        self.port = port
+
+    @staticmethod
+    def _resolve_hub_endpoint(hub, host, port, timeout):
+        if hub is None:
+            return (
+                "127.0.0.1" if host is None else host,
+                31415 if port is None else port,
+                60000.0 if timeout is None else timeout,
+            )
+        if any(x is not None for x in (host, port, timeout)):
+            raise ValueError("Specify either hub or explicit host/port/timeout, not both.")
+        return hub.host, hub.port, hub.timeout
+
+    def eval_susceptibility(self, freq):
+        return np.zeros((np.asarray(freq).size, 3, 3), dtype=complex)
+
+
 class NoisyDrudeSusceptibility(DrudeSusceptibility):
     """
     Specifies a single dispersive susceptibility of Lorentzian (damped harmonic

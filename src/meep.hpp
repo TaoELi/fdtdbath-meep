@@ -20,6 +20,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -339,6 +340,56 @@ protected:
   std::vector<realnum> bath_gammas; // decay rate of each bath oscillator
   std::vector<realnum> bath_anharmonicities; // anharmonic coefficient of each bath oscillator
   realnum noise_amp; // random noise :)
+};
+
+/* Socket-backed MaxwellLink molecular susceptibility.  Each active Yee-grid
+   site is coupled to one external MaxwellLink molecule and the returned
+   dmu/dt is integrated into the local polarization density.  The sigma arrays
+   are used only to select active grid points and tensor components. */
+class mxl_socket_susceptibility : public susceptibility {
+public:
+  mxl_socket_susceptibility(realnum rescaling_factor = 1.0, realnum time_units_fs = 0.1,
+                            realnum timeout = 60000.0, const char *host = "127.0.0.1",
+                            int port = 31415);
+  virtual susceptibility *clone() const { return new mxl_socket_susceptibility(*this); }
+  virtual ~mxl_socket_susceptibility() {}
+
+  virtual bool needs_P(component c, int cmp, realnum *W[NUM_FIELD_COMPONENTS][2]) const;
+  virtual bool needs_W_notowned(component c, realnum *W[NUM_FIELD_COMPONENTS][2]) const;
+
+  virtual void update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
+                        realnum *W_prev[NUM_FIELD_COMPONENTS][2], realnum dt,
+                        const grid_volume &gv, void *P_internal_data) const;
+
+  virtual void subtract_P(field_type ft, realnum *f_minus_p[NUM_FIELD_COMPONENTS][2],
+                          void *P_internal_data) const;
+
+  virtual void *new_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2],
+                                  const grid_volume &gv) const;
+  virtual void delete_internal_data(void *data) const;
+  virtual void init_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2], realnum dt,
+                                  const grid_volume &gv, void *data) const;
+  virtual void *copy_internal_data(void *data) const;
+
+  virtual int num_cinternal_notowned_needed(component c, void *P_internal_data) const;
+  virtual realnum *cinternal_notowned_ptr(int inotowned, component c, int cmp, int n,
+                                          void *P_internal_data) const;
+
+  virtual void dump_params(h5file *h5f, size_t *start);
+  virtual int get_num_params();
+
+  realnum get_rescaling_factor() const { return rescaling_factor; }
+  realnum get_time_units_fs() const { return time_units_fs; }
+  realnum get_timeout() const { return timeout; }
+  const char *get_host() const { return host.c_str(); }
+  int get_port() const { return port; }
+
+protected:
+  realnum rescaling_factor;
+  realnum time_units_fs;
+  realnum timeout;
+  std::string host;
+  int port;
 };
 
 typedef enum { GYROTROPIC_LORENTZIAN, GYROTROPIC_DRUDE, GYROTROPIC_SATURATED } gyrotropy_model;
@@ -1633,7 +1684,7 @@ private:
   void phase_material(int phasein_time);
   bool step_db(field_type ft);
   void step_source(field_type ft, bool including_integrated);
-  bool update_pols(field_type ft);
+  bool update_pols(field_type ft, bool update = true);
   void calc_sources(double time);
 
   // initialize.cpp

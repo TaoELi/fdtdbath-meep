@@ -23,7 +23,13 @@ except ImportError:
     from collections.abc import Sequence, Iterable
 
 import numpy as np
-from meep.geom import GeometricObject, Medium, Vector3, init_do_averaging
+from meep.geom import (
+    GeometricObject,
+    Medium,
+    MXLSocketSusceptibility,
+    Vector3,
+    init_do_averaging,
+)
 from meep.source import (
     EigenModeSource,
     GaussianBeamSource,
@@ -1634,6 +1640,27 @@ class Simulation:
 
         return fmin, fmax
 
+    @staticmethod
+    def _material_has_mxl_socket_susceptibility(mat) -> bool:
+        if not isinstance(mat, Medium):
+            return False
+        return any(isinstance(s, MXLSocketSusceptibility) for s in mat.E_susceptibilities)
+
+    def _uses_mxl_socket_susceptibility(
+        self,
+        geometry: List[GeometricObject] = None,
+        default_material: Medium = None,
+    ) -> bool:
+        """Returns whether current or replacement materials use MXLSocketSusceptibility."""
+        materials = [getattr(go, "material", None) for go in self.geometry]
+        materials.append(self.default_material)
+        if geometry is not None:
+            materials.extend(getattr(go, "material", None) for go in geometry)
+        if default_material is not None:
+            materials.append(default_material)
+        materials.extend(self.extra_materials)
+        return any(self._material_has_mxl_socket_susceptibility(mat) for mat in materials)
+
     def _check_material_frequencies(self):
 
         min_freq, max_freq = self._get_valid_material_frequencies()
@@ -2228,7 +2255,18 @@ class Simulation:
         """
         This can be called in a step function, and is useful for changing the geometry or
         default material as a function of time.
+
+        Raises:
+          RuntimeError: if the initialized simulation uses MXLSocketSusceptibility,
+            whose socket molecule ownership is tied to the original chunk layout.
         """
+        if self.fields and self._uses_mxl_socket_susceptibility(geometry, default_material):
+            raise RuntimeError(
+                "Simulation.set_materials cannot be used after initialization with "
+                "MXLSocketSusceptibility because socket molecule ownership is tied "
+                "to the fixed chunk layout."
+            )
+
         if self.fields:
             self.fields.remove_susceptibilities()
 

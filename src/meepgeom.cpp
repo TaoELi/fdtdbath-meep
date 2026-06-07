@@ -19,6 +19,10 @@
 #include "meepgeom.hpp"
 #include "meep_internals.hpp"
 
+namespace meep {
+void reset_mxl_socket_susceptibility_chunk_ordinals();
+}
+
 namespace meep_geom {
 
 #define master_printf meep::master_printf
@@ -55,7 +59,11 @@ bool susceptibility_equal(const susceptibility &s1, const susceptibility &s2) {
           vector3_equal(s1.sigma_offdiag, s2.sigma_offdiag) && vector3_equal(s1.bias, s2.bias) &&
           s1.frequency == s2.frequency && s1.gamma == s2.gamma && s1.alpha == s2.alpha &&
           s1.noise_amp == s2.noise_amp && s1.drude == s2.drude &&
-          s1.saturated_gyrotropy == s2.saturated_gyrotropy && s1.is_file == s2.is_file);
+          s1.saturated_gyrotropy == s2.saturated_gyrotropy && s1.is_file == s2.is_file &&
+          s1.is_mxl_socket == s2.is_mxl_socket &&
+          s1.mxl_rescaling_factor == s2.mxl_rescaling_factor &&
+          s1.mxl_time_units_fs == s2.mxl_time_units_fs && s1.mxl_timeout == s2.mxl_timeout &&
+          s1.mxl_host == s2.mxl_host && s1.mxl_port == s2.mxl_port);
 }
 
 bool susceptibility_list_equal(const susceptibility_list &s1, const susceptibility_list &s2) {
@@ -1639,6 +1647,12 @@ static bool susceptibility_equiv(const susceptibility &o0, const susceptibility 
   if (o0.drude != o.drude) return false;
   if (o0.saturated_gyrotropy != o.saturated_gyrotropy) return false;
   if (o0.is_file != o.is_file) return false;
+  if (o0.is_mxl_socket != o.is_mxl_socket) return false;
+  if (o0.mxl_rescaling_factor != o.mxl_rescaling_factor) return false;
+  if (o0.mxl_time_units_fs != o.mxl_time_units_fs) return false;
+  if (o0.mxl_timeout != o.mxl_timeout) return false;
+  if (o0.mxl_host != o.mxl_host) return false;
+  if (o0.mxl_port != o.mxl_port) return false;
 
   if (o0.transitions != o.transitions) return false;
   if (o0.initial_populations != o.initial_populations) return false;
@@ -1809,6 +1823,7 @@ static pol *add_pols(pol *pols, const susceptibility_list &slist) {
 }
 
 void geom_epsilon::add_susceptibilities(meep::structure *s) {
+  meep::reset_mxl_socket_susceptibility_chunk_ordinals();
   add_susceptibilities(meep::E_stuff, s);
   add_susceptibilities(meep::H_stuff, s);
 }
@@ -1839,7 +1854,18 @@ void geom_epsilon::add_susceptibilities(meep::field_type ft, meep::structure *s)
         (ss->saturated_gyrotropy || ss->bias.x != 0.0 || ss->bias.y != 0.0 || ss->bias.z != 0.0);
     meep::susceptibility *sus;
 
-    if (ss->transitions.size() != 0 || ss->initial_populations.size() != 0) {
+    if (ss->is_mxl_socket) {
+      if (ft != meep::E_stuff)
+        meep::abort("MXLSocketSusceptibility currently supports only E_susceptibilities.");
+      sus = new meep::mxl_socket_susceptibility(ss->mxl_rescaling_factor, ss->mxl_time_units_fs,
+                                                ss->mxl_timeout, ss->mxl_host.c_str(),
+                                                ss->mxl_port);
+      if (meep::verbosity > 0) {
+        master_printf("MaxwellLink socket susceptibility: host=%s, port=%d, rescaling_factor=%g\n",
+                      ss->mxl_host.c_str(), ss->mxl_port, ss->mxl_rescaling_factor);
+      }
+    }
+    else if (ss->transitions.size() != 0 || ss->initial_populations.size() != 0) {
       // multilevel atom
       sus = make_multilevel_sus(ss);
       if (meep::verbosity > 0) master_printf("multilevel atom susceptibility\n");

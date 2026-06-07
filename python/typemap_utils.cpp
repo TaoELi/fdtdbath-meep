@@ -412,10 +412,47 @@ static int py_susceptibility_to_susceptibility(PyObject *po, susceptibility_stru
   s->bath_couplings.resize(0);
   s->bath_gammas.resize(0);
   s->bath_anharmonicities.resize(0);
+  s->is_mxl_socket = false;
+  s->mxl_rescaling_factor = 1.0;
+  s->mxl_time_units_fs = 0.1;
+  s->mxl_timeout = 60000.0;
+  s->mxl_host = "127.0.0.1";
+  s->mxl_port = 31415;
   s->bias.x = s->bias.y = s->bias.z = 0;
   s->saturated_gyrotropy = false;
   s->transitions.resize(0);
   s->initial_populations.resize(0);
+
+  std::string class_name = py_class_name_as_string(po);
+
+  // MXLSocketSusceptibility stores its socket parameters separately; its
+  // inherited sigma value is only an active-material marker.
+  if (class_name.find(std::string("MXLSocket")) != std::string::npos) {
+    s->is_mxl_socket = true;
+    if (PyObject_HasAttrString(po, "rescaling_factor")) {
+      if (!get_attr_dbl(po, &s->mxl_rescaling_factor, "rescaling_factor")) { return 0; }
+    }
+    if (PyObject_HasAttrString(po, "time_units_fs")) {
+      if (!get_attr_dbl(po, &s->mxl_time_units_fs, "time_units_fs")) { return 0; }
+    }
+    if (PyObject_HasAttrString(po, "timeout")) {
+      if (!get_attr_dbl(po, &s->mxl_timeout, "timeout")) { return 0; }
+    }
+    if (PyObject_HasAttrString(po, "host")) {
+      PyObject *py_host = PyObject_GetAttrString(po, "host");
+      if (!py_host) { return 0; }
+      const char *host = PyObject_ToCharPtr(py_host);
+      if (!host) {
+        Py_DECREF(py_host);
+        return 0;
+      }
+      s->mxl_host = host;
+      Py_DECREF(py_host);
+    }
+    if (PyObject_HasAttrString(po, "port")) {
+      if (!get_attr_int(po, &s->mxl_port, "port")) { return 0; }
+    }
+  }
 
   if (PyObject_HasAttrString(po, "frequency")) {
     if (!get_attr_dbl(po, &s->frequency, "frequency")) { return 0; }
@@ -514,8 +551,6 @@ static int py_susceptibility_to_susceptibility(PyObject *po, susceptibility_stru
     }
     Py_DECREF(py_pop);
   }
-
-  std::string class_name = py_class_name_as_string(po);
 
   if (class_name.find(std::string("Drude")) != std::string::npos) { s->drude = true; }
   else { s->drude = false; }
@@ -705,7 +740,28 @@ static PyObject *susceptibility_to_py_obj(const susceptibility_struct *s) {
   PyObject *args = PyTuple_New(0);
 
   // Use an if/else chain to choose exactly one type.
-  if (s->num_bath > 0 && s->bath_frequencies.size() > 0) {
+  if (s->is_mxl_socket) {
+    PyObject *py_mxl_socket_class = PyObject_GetAttrString(geom_mod, "MXLSocketSusceptibility");
+    res = PyObject_Call(py_mxl_socket_class, args, NULL);
+    Py_DECREF(py_mxl_socket_class);
+
+    PyObject *py_rescaling = PyFloat_FromDouble(s->mxl_rescaling_factor);
+    PyObject *py_time_units = PyFloat_FromDouble(s->mxl_time_units_fs);
+    PyObject *py_timeout = PyFloat_FromDouble(s->mxl_timeout);
+    PyObject *py_host = PyUnicode_FromString(s->mxl_host.c_str());
+    PyObject *py_port = PyLong_FromLong(s->mxl_port);
+    PyObject_SetAttrString(res, "rescaling_factor", py_rescaling);
+    PyObject_SetAttrString(res, "time_units_fs", py_time_units);
+    PyObject_SetAttrString(res, "timeout", py_timeout);
+    PyObject_SetAttrString(res, "host", py_host);
+    PyObject_SetAttrString(res, "port", py_port);
+    Py_DECREF(py_rescaling);
+    Py_DECREF(py_time_units);
+    Py_DECREF(py_timeout);
+    Py_DECREF(py_host);
+    Py_DECREF(py_port);
+  }
+  else if (s->num_bath > 0 && s->bath_frequencies.size() > 0) {
     PyObject *py_bath_lorentz_class = PyObject_GetAttrString(geom_mod, "BathLorentzianSusceptibility");
     res = PyObject_Call(py_bath_lorentz_class, args, NULL);
     Py_DECREF(py_bath_lorentz_class);

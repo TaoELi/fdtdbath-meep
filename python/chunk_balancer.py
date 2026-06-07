@@ -56,8 +56,17 @@ class AbstractChunkBalancer(abc.ABC):
           ValueError: if sim.chunk_layout has proc_ids not included in
             sim.structure.get_chunk_owners() (this could occur if number of
             processes exceeds the number of physical cores)
+          RuntimeError: if the simulation uses MXLSocketSusceptibility, whose
+            socket molecule ownership is tied to the current chunk layout
         """
         self._validate_sim(sim)
+
+        if sim._uses_mxl_socket_susceptibility():
+            raise RuntimeError(
+                "Adaptive chunk rebalancing is not supported with "
+                "MXLSocketSusceptibility because socket molecule ownership is tied "
+                "to the fixed chunk layout."
+            )
 
         if self.should_adjust_chunk_layout(sim):
 
