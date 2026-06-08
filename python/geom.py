@@ -1088,6 +1088,7 @@ class MXLSocketSusceptibility(Susceptibility):
         timeout=None,
         host=None,
         port=None,
+        real_field_only=True,
     ):
         """
         + **`rescaling_factor` [`number`]** — The effective number of physical
@@ -1105,6 +1106,11 @@ class MXLSocketSusceptibility(Susceptibility):
 
         + **`port` [`integer`]** — MaxwellLink hub TCP port.
 
+        + **`real_field_only` [`boolean`]** — If true, socket molecules are
+          driven only by the real electric field component. If false, complex
+          Meep runs use independent socket molecules for real and imaginary
+          electric field components.
+
         The usual Meep material geometry selects active grid points. This
         susceptibility does not expose a public `sigma` argument.
         """
@@ -1120,11 +1126,14 @@ class MXLSocketSusceptibility(Susceptibility):
             raise ValueError("host must be a nonempty string.")
         if port <= 0 or port > 65535:
             raise ValueError("port must be in the range [1, 65535].")
+        if not isinstance(real_field_only, (bool, np.bool_)):
+            raise ValueError("real_field_only must be a boolean.")
         self.rescaling_factor = rescaling_factor
         self.time_units_fs = time_units_fs
         self.timeout = timeout
         self.host = host
         self.port = port
+        self.real_field_only = bool(real_field_only)
 
     @staticmethod
     def _resolve_hub_endpoint(hub, host, port, timeout):

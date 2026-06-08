@@ -418,6 +418,7 @@ static int py_susceptibility_to_susceptibility(PyObject *po, susceptibility_stru
   s->mxl_timeout = 60000.0;
   s->mxl_host = "127.0.0.1";
   s->mxl_port = 31415;
+  s->mxl_real_field_only = true;
   s->bias.x = s->bias.y = s->bias.z = 0;
   s->saturated_gyrotropy = false;
   s->transitions.resize(0);
@@ -451,6 +452,14 @@ static int py_susceptibility_to_susceptibility(PyObject *po, susceptibility_stru
     }
     if (PyObject_HasAttrString(po, "port")) {
       if (!get_attr_int(po, &s->mxl_port, "port")) { return 0; }
+    }
+    if (PyObject_HasAttrString(po, "real_field_only")) {
+      PyObject *py_real_field_only = PyObject_GetAttrString(po, "real_field_only");
+      if (!py_real_field_only) { return 0; }
+      int is_true = PyObject_IsTrue(py_real_field_only);
+      Py_DECREF(py_real_field_only);
+      if (is_true < 0) { return 0; }
+      s->mxl_real_field_only = is_true != 0;
     }
   }
 
@@ -750,16 +759,19 @@ static PyObject *susceptibility_to_py_obj(const susceptibility_struct *s) {
     PyObject *py_timeout = PyFloat_FromDouble(s->mxl_timeout);
     PyObject *py_host = PyUnicode_FromString(s->mxl_host.c_str());
     PyObject *py_port = PyLong_FromLong(s->mxl_port);
+    PyObject *py_real_field_only = PyBool_FromLong(s->mxl_real_field_only ? 1 : 0);
     PyObject_SetAttrString(res, "rescaling_factor", py_rescaling);
     PyObject_SetAttrString(res, "time_units_fs", py_time_units);
     PyObject_SetAttrString(res, "timeout", py_timeout);
     PyObject_SetAttrString(res, "host", py_host);
     PyObject_SetAttrString(res, "port", py_port);
+    PyObject_SetAttrString(res, "real_field_only", py_real_field_only);
     Py_DECREF(py_rescaling);
     Py_DECREF(py_time_units);
     Py_DECREF(py_timeout);
     Py_DECREF(py_host);
     Py_DECREF(py_port);
+    Py_DECREF(py_real_field_only);
   }
   else if (s->num_bath > 0 && s->bath_frequencies.size() > 0) {
     PyObject *py_bath_lorentz_class = PyObject_GetAttrString(geom_mod, "BathLorentzianSusceptibility");

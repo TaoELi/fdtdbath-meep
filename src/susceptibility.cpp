@@ -213,8 +213,10 @@ const int mxl_max_molecule_id = 2147483647;
 /* These counters are reset whenever material susceptibilities are rebuilt. */
 int mxl_next_chunk_ordinal = 0;
 size_t mxl_local_active_site_count = 0;
+size_t mxl_local_required_driver_count = 0;
 bool mxl_socket_susceptibility_present = false;
 bool mxl_driver_count_reported = false;
+bool mxl_socket_imag_field_coupling_active = false;
 
 static int mxl_dim_power(ndim dim) {
   switch (dim) {
@@ -491,6 +493,7 @@ struct mxl_socket_data {
   realnum *P[NUM_FIELD_COMPONENTS][2];
   std::vector<realnum> P_store[NUM_FIELD_COMPONENTS][2];
   std::vector<size_t> active_indices;
+  std::vector<int> drive_cmps;
   std::vector<int> molecule_ids;
   std::vector<double> efields_au;
   std::vector<double> amps_au;
@@ -502,8 +505,9 @@ struct mxl_socket_data {
   }
 
   mxl_socket_data(const mxl_socket_data &other)
-      : ntot(other.ntot), active_indices(other.active_indices), molecule_ids(other.molecule_ids),
-        efields_au(other.efields_au), amps_au(other.amps_au), initialized(false), client() {
+      : ntot(other.ntot), active_indices(other.active_indices), drive_cmps(other.drive_cmps),
+        molecule_ids(other.molecule_ids), efields_au(other.efields_au),
+        amps_au(other.amps_au), initialized(false), client() {
     FOR_COMPONENTS(c) DOCMP2 { P_store[c][cmp] = other.P_store[c][cmp]; }
     reset_ptrs();
   }
@@ -520,8 +524,10 @@ struct mxl_socket_data {
 void reset_mxl_socket_susceptibility_chunk_ordinals() {
   mxl_next_chunk_ordinal = 0;
   mxl_local_active_site_count = 0;
+  mxl_local_required_driver_count = 0;
   mxl_socket_susceptibility_present = false;
   mxl_driver_count_reported = false;
+  mxl_socket_imag_field_coupling_active = false;
 }
 
 void report_mxl_socket_susceptibility_driver_count(field_type ft) {
@@ -536,14 +542,23 @@ void report_mxl_socket_susceptibility_driver_count(field_type ft) {
   }
 
   const size_t total_active_site_count = sum_to_all(mxl_local_active_site_count);
+  const size_t total_required_driver_count = sum_to_all(mxl_local_required_driver_count);
+  const bool imag_field_coupling_active = or_to_all(mxl_socket_imag_field_coupling_active);
   begin_critical_section(31415);
   printf("MXLSocketSusceptibility rank %d: required socket drivers = %zu\n", my_rank(),
-         mxl_local_active_site_count);
+         mxl_local_required_driver_count);
   fflush(stdout);
   end_critical_section(31415);
   all_wait();
   master_printf("MXLSocketSusceptibility total required socket drivers = %zu\n",
+                total_required_driver_count);
+  master_printf("MXLSocketSusceptibility total active grid points = %zu\n",
                 total_active_site_count);
+  if (imag_field_coupling_active)
+    master_printf("MXLSocketSusceptibility complex-field imaginary coupling enabled: "
+                  "independent socket molecules are used for real and imaginary E-field "
+                  "components, so required socket drivers are doubled relative to active "
+                  "grid points.\n");
   mxl_driver_count_reported = true;
 }
 
@@ -1139,9 +1154,10 @@ void bath_lorentzian_susceptibility::dump_params(h5file *h5f, size_t *start) {
 
 mxl_socket_susceptibility::mxl_socket_susceptibility(realnum rescaling_factor,
                                                      realnum time_units_fs, realnum timeout,
-                                                     const char *host, int port)
+                                                     const char *host, int port,
+                                                     bool real_field_only)
     : rescaling_factor(rescaling_factor), time_units_fs(time_units_fs), timeout(timeout),
-      host(host ? host : "127.0.0.1"), port(port) {
+      host(host ? host : "127.0.0.1"), port(port), real_field_only(real_field_only) {
   mxl_socket_susceptibility_present = true;
   mxl_assert_little_endian();
   if (rescaling_factor < 0.0)
@@ -1156,9 +1172,12 @@ mxl_socket_susceptibility::mxl_socket_susceptibility(realnum rescaling_factor,
 
 bool mxl_socket_susceptibility::needs_P(component c, int cmp,
                                         realnum *W[NUM_FIELD_COMPONENTS][2]) const {
-  if (cmp != 0) return false;
   if (!is_electric(c)) return false;
   direction d = component_direction(c);
+  /* In complex-field Meep runs, boundary exchange expects valid real and
+     imaginary polarization storage.  In real_field_only mode P[c][1] remains
+     allocated but is left at zero; otherwise independent socket molecules
+     drive and update it from W[c][1]. */
   return !trivial_sigma[c][d] && W[c][cmp];
 }
 
@@ -1203,7 +1222,7 @@ void mxl_socket_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONEN
     if (!is_electric(c) || !gv.has_field(c)) continue;
     direction dc = component_direction(c);
     const realnum *s = sigma[c][dc];
-    if (!s || !W[c][0]) continue;
+    if (!s || (!W[c][0] && !W[c][1])) continue;
     PLOOP_OVER_VOL_OWNED(gv, c, i) {
       if (s[i] != 0.0) active[(size_t)i] = 1;
     }
@@ -1213,9 +1232,24 @@ void mxl_socket_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONEN
   for (size_t i = 0; i < active.size(); ++i)
     if (active[i]) d->active_indices.push_back(i);
 
-  if (d->active_indices.size() >= (size_t)mxl_molecules_per_chunk_id_block)
-    meep::abort("MXLSocketSusceptibility active site count %zu exceeds per-chunk id block %d.",
-                d->active_indices.size(), mxl_molecules_per_chunk_id_block);
+  d->drive_cmps.clear();
+  d->drive_cmps.push_back(0);
+  if (!real_field_only) {
+    bool has_imag_fields = false;
+    FOR_COMPONENTS(c) {
+      if (is_electric(c) && gv.has_field(c) && W[c][1]) {
+        has_imag_fields = true;
+        break;
+      }
+    }
+    if (has_imag_fields) d->drive_cmps.push_back(1);
+  }
+
+  const size_t required_driver_count = d->active_indices.size() * d->drive_cmps.size();
+  if (required_driver_count >= (size_t)mxl_molecules_per_chunk_id_block)
+    meep::abort("MXLSocketSusceptibility required socket driver count %zu exceeds per-chunk id "
+                "block %d.",
+                required_driver_count, mxl_molecules_per_chunk_id_block);
 
   /* Rank/chunk id blocks keep molecule ids deterministic for a fixed chunk
      decomposition. */
@@ -1227,18 +1261,21 @@ void mxl_socket_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONEN
   const long long rank_chunk =
       ((long long)my_rank()) * mxl_chunks_per_rank_id_block + chunk_ordinal;
   const long long base_id_long = rank_chunk * mxl_molecules_per_chunk_id_block;
-  if (base_id_long + (long long)d->active_indices.size() > mxl_max_molecule_id)
+  if (base_id_long + (long long)required_driver_count > mxl_max_molecule_id)
     meep::abort("MXLSocketSusceptibility molecule ids exceed the int32 protocol range.");
 
   int base_id = (int)base_id_long;
-  d->molecule_ids.resize(d->active_indices.size());
+  d->molecule_ids.resize(required_driver_count);
   for (size_t i = 0; i < d->molecule_ids.size(); ++i)
     d->molecule_ids[i] = base_id + (int)i;
 
   mxl_local_active_site_count += d->active_indices.size();
+  mxl_local_required_driver_count += required_driver_count;
+  if (!d->active_indices.empty() && d->drive_cmps.size() > 1)
+    mxl_socket_imag_field_coupling_active = true;
 
-  d->efields_au.assign(3 * d->active_indices.size(), 0.0);
-  d->amps_au.assign(3 * d->active_indices.size(), 0.0);
+  d->efields_au.assign(3 * required_driver_count, 0.0);
+  d->amps_au.assign(3 * required_driver_count, 0.0);
   d->initialized = false;
 }
 
@@ -1256,14 +1293,18 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
   if (!d || d->active_indices.empty() || rescaling_factor == 0.0) return;
 
   const double efield_factor = mxl_efield_mu_to_au_prefactor / (time_units_fs * time_units_fs);
-  const size_t n = d->active_indices.size();
+  const size_t nsites = d->active_indices.size();
 
   component comps[3] = {Ex, Ey, Ez};
-  for (size_t imol = 0; imol < n; ++imol) {
-    size_t idx = d->active_indices[imol];
-    for (int axis = 0; axis < 3; ++axis) {
-      component c = comps[axis];
-      d->efields_au[3 * imol + axis] = W[c][0] ? efield_factor * W[c][0][idx] : 0.0;
+  for (size_t icmp = 0; icmp < d->drive_cmps.size(); ++icmp) {
+    int cmp = d->drive_cmps[icmp];
+    for (size_t isite = 0; isite < nsites; ++isite) {
+      size_t imol = icmp * nsites + isite;
+      size_t idx = d->active_indices[isite];
+      for (int axis = 0; axis < 3; ++axis) {
+        component c = comps[axis];
+        d->efields_au[3 * imol + axis] = W[c][cmp] ? efield_factor * W[c][cmp][idx] : 0.0;
+      }
     }
   }
 
@@ -1285,16 +1326,20 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
 
   FOR_COMPONENTS(c) {
     if (!is_electric(c) || !gv.has_field(c)) continue;
-    realnum *p = d->P[c][0];
-    if (!p) continue;
     direction dc = component_direction(c);
     const realnum *s = sigma[c][dc];
     if (!s) continue;
     int axis = mxl_amp_axis(c);
-    for (size_t imol = 0; imol < n; ++imol) {
-      size_t idx = d->active_indices[imol];
-      if (s[idx] != 0.0)
-        p[idx] += (realnum)(dt * pdot_scale * s[idx] * d->amps_au[3 * imol + axis]);
+    for (size_t icmp = 0; icmp < d->drive_cmps.size(); ++icmp) {
+      int cmp = d->drive_cmps[icmp];
+      realnum *p = d->P[c][cmp];
+      if (!p) continue;
+      for (size_t isite = 0; isite < nsites; ++isite) {
+        size_t imol = icmp * nsites + isite;
+        size_t idx = d->active_indices[isite];
+        if (s[idx] != 0.0)
+          p[idx] += (realnum)(dt * pdot_scale * s[idx] * d->amps_au[3 * imol + axis]);
+      }
     }
   }
 }

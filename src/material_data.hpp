@@ -75,6 +75,7 @@ typedef struct susceptibility_struct {
   double mxl_timeout;
   std::string mxl_host;
   int mxl_port;
+  bool mxl_real_field_only;
 } susceptibility;
 
 using susceptibility_list = std::vector<susceptibility>;
