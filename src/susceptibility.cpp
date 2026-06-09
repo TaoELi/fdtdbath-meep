@@ -224,9 +224,29 @@ static int mxl_dim_power(ndim dim) {
     case D1: return 1;
     case D2: return 2;
     case D3: return 3;
-    case Dcyl: return 2;
+    /* MXLSocketSusceptibility keeps rescaling_factor tied to the
+       equivalent 3d Cartesian Yee-cell volume.  Cylindrical annular
+       integration weights belong in global integrals, not in the local
+       polarization-density update. */
+    case Dcyl: return 3;
   }
   return 3;
+}
+
+static void mxl_field_components(ndim dim, component comps[3]) {
+  if (dim == Dcyl) {
+    /* The socket protocol remains Cartesian.  Cylindrical Meep fields are
+       modal coefficients in the local (r,phi,z) basis; at phi=0 this maps
+       to the socket's (x,y,z) slots. */
+    comps[0] = Er;
+    comps[1] = Ep;
+    comps[2] = Ez;
+  }
+  else {
+    comps[0] = Ex;
+    comps[1] = Ey;
+    comps[2] = Ez;
+  }
 }
 
 static int mxl_amp_axis(component c) {
@@ -1208,8 +1228,6 @@ void mxl_socket_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONEN
                                                    void *data) const {
   (void)dt;
   mxl_socket_data *d = (mxl_socket_data *)data;
-  if (gv.dim == Dcyl)
-    meep::abort("MXLSocketSusceptibility currently supports only Cartesian grids.");
   d->ntot = gv.ntot();
 
   FOR_COMPONENTS(c) DOCMP2 {
@@ -1299,7 +1317,8 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
   const double efield_factor = mxl_efield_mu_to_au_prefactor / (time_units_fs * time_units_fs);
   const size_t nsites = d->active_indices.size();
 
-  component comps[3] = {Ex, Ey, Ez};
+  component comps[3];
+  mxl_field_components(gv.dim, comps);
   for (size_t icmp = 0; icmp < d->drive_cmps.size(); ++icmp) {
     int cmp = d->drive_cmps[icmp];
     for (size_t isite = 0; isite < nsites; ++isite) {
