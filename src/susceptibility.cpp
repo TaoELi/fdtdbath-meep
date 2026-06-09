@@ -214,6 +214,7 @@ const int mxl_max_molecule_id = 2147483647;
 int mxl_next_chunk_ordinal = 0;
 size_t mxl_local_active_site_count = 0;
 size_t mxl_local_required_driver_count = 0;
+size_t mxl_expected_total_required_driver_count = 0;
 bool mxl_socket_susceptibility_present = false;
 bool mxl_driver_count_reported = false;
 bool mxl_socket_imag_field_coupling_active = false;
@@ -319,7 +320,7 @@ public:
   }
 
   void send_init(const std::vector<int> &molecule_ids, double dt_au, double rescaling_factor,
-                 double time_units_fs, double timeout, int rank) {
+                 double time_units_fs, double timeout, int rank, size_t expected_total_molecules) {
     std::ostringstream json;
     json.precision(17);
     json << "{\"protocol\":\"mxl_socket_susceptibility_v1\",";
@@ -328,6 +329,7 @@ public:
     json << "\"rescaling_factor\":" << rescaling_factor << ",";
     json << "\"time_units_fs\":" << time_units_fs << ",";
     json << "\"timeout\":" << timeout << ",";
+    json << "\"expected_total_molecules\":" << expected_total_molecules << ",";
     json << "\"molecule_ids\":[";
     for (size_t i = 0; i < molecule_ids.size(); ++i) {
       if (i) json << ",";
@@ -525,6 +527,7 @@ void reset_mxl_socket_susceptibility_chunk_ordinals() {
   mxl_next_chunk_ordinal = 0;
   mxl_local_active_site_count = 0;
   mxl_local_required_driver_count = 0;
+  mxl_expected_total_required_driver_count = 0;
   mxl_socket_susceptibility_present = false;
   mxl_driver_count_reported = false;
   mxl_socket_imag_field_coupling_active = false;
@@ -543,6 +546,7 @@ void report_mxl_socket_susceptibility_driver_count(field_type ft) {
 
   const size_t total_active_site_count = sum_to_all(mxl_local_active_site_count);
   const size_t total_required_driver_count = sum_to_all(mxl_local_required_driver_count);
+  mxl_expected_total_required_driver_count = total_required_driver_count;
   const bool imag_field_coupling_active = or_to_all(mxl_socket_imag_field_coupling_active);
   begin_critical_section(31415);
   printf("MXLSocketSusceptibility rank %d: required socket drivers = %zu\n", my_rank(),
@@ -1312,7 +1316,7 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
   if (!d->initialized) {
     double dt_au = dt * time_units_fs * mxl_fs_to_au;
     d->client.send_init(d->molecule_ids, dt_au, rescaling_factor, time_units_fs, timeout,
-                        my_rank());
+                        my_rank(), mxl_expected_total_required_driver_count);
     d->initialized = true;
   }
   d->client.step(d->molecule_ids, d->efields_au, d->amps_au);
