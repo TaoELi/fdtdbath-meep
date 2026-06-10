@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netdb.h>
+#include <unordered_map>
 #include <unistd.h>
 #include "meep.hpp"
 #include "meep_internals.hpp"
@@ -281,11 +282,7 @@ static int mxl_read_i32(const unsigned char *p) {
   return (int)v;
 }
 
-static void mxl_append_f64(std::vector<unsigned char> &buf, double value) {
-  unsigned char bytes[sizeof(double)];
-  memcpy(bytes, &value, sizeof(double));
-  buf.insert(buf.end(), bytes, bytes + sizeof(double));
-}
+static void mxl_write_f64(unsigned char *p, double value) { memcpy(p, &value, sizeof(double)); }
 
 static double mxl_read_f64(const unsigned char *p) {
   double value;
@@ -296,10 +293,12 @@ static double mxl_read_f64(const unsigned char *p) {
 /* Minimal TCP client for the aggregate MaxwellLink susceptibility protocol. */
 class mxl_socket_client {
 public:
-  mxl_socket_client() : fd(-1) {}
-  mxl_socket_client(const mxl_socket_client &) : fd(-1) {}
+  mxl_socket_client() : fd(-1), cached_nreq(0), cached_molecule_id_data(NULL) {}
+  mxl_socket_client(const mxl_socket_client &)
+      : fd(-1), cached_nreq(0), cached_molecule_id_data(NULL) {}
   mxl_socket_client &operator=(const mxl_socket_client &) {
     close();
+    clear_step_cache();
     fd = -1;
     return *this;
   }
@@ -372,48 +371,44 @@ public:
     if (efields_au.size() != 3 * nreq)
       meep::abort("MXLSocketSusceptibility internal efield array size mismatch.");
 
-    std::vector<unsigned char> frame;
-    frame.reserve(20 + 24 * nreq + 8 * nreq);
-    append_header(frame, "AGGSTEP");
-    mxl_append_i32(frame, (int)nreq);
-    mxl_append_i32(frame, (int)nreq);
+    ensure_step_cache(molecule_ids);
+    unsigned char *field_data = step_frame.data() + 20;
     for (size_t i = 0; i < nreq; ++i) {
-      mxl_append_f64(frame, efields_au[3 * i + 0]);
-      mxl_append_f64(frame, efields_au[3 * i + 1]);
-      mxl_append_f64(frame, efields_au[3 * i + 2]);
+      mxl_write_f64(field_data + 24 * i + 0, efields_au[3 * i + 0]);
+      mxl_write_f64(field_data + 24 * i + 8, efields_au[3 * i + 1]);
+      mxl_write_f64(field_data + 24 * i + 16, efields_au[3 * i + 2]);
     }
-    for (size_t i = 0; i < nreq; ++i) {
-      mxl_append_i32(frame, molecule_ids[i]);
-      mxl_append_i32(frame, (int)i);
-    }
-    send_all(frame.data(), frame.size());
+    send_all(step_frame.data(), step_frame.size());
 
-    std::vector<unsigned char> head(16);
-    recv_all(head.data(), head.size());
-    std::string header = parse_header(head.data());
+    recv_all(result_head.data(), result_head.size());
+    std::string header = parse_header(result_head.data());
     if (header != "AGGRESULT")
       meep::abort("MXLSocketSusceptibility expected AGGRESULT, got '%s'", header.c_str());
 
-    int nresp = mxl_read_i32(head.data() + 12);
+    int nresp = mxl_read_i32(result_head.data() + 12);
     if (nresp < 0) meep::abort("MXLSocketSusceptibility received negative response count.");
 
-    std::vector<unsigned char> fixed((size_t)nresp * 32);
-    if (!fixed.empty()) recv_all(fixed.data(), fixed.size());
+    result_fixed.resize((size_t)nresp * 32);
+    if (!result_fixed.empty()) recv_all(result_fixed.data(), result_fixed.size());
 
-    amps_au.assign(3 * nreq, 0.0);
-    std::vector<char> seen(nreq, 0);
+    if (amps_au.size() != 3 * nreq) amps_au.resize(3 * nreq);
+    std::fill(amps_au.begin(), amps_au.end(), 0.0);
+    std::fill(seen.begin(), seen.end(), 0);
     size_t total_extra = 0;
-    std::unordered_map<int, size_t> id_to_index;
-    for (size_t i = 0; i < nreq; ++i)
-      id_to_index[molecule_ids[i]] = i;
 
     for (int j = 0; j < nresp; ++j) {
-      const unsigned char *rec = fixed.data() + (size_t)j * 32;
+      const unsigned char *rec = result_fixed.data() + (size_t)j * 32;
       int mid = mxl_read_i32(rec);
-      std::unordered_map<int, size_t>::const_iterator it = id_to_index.find(mid);
-      if (it == id_to_index.end())
-        meep::abort("MXLSocketSusceptibility received response for unknown molecule_id %d", mid);
-      size_t idx = it->second;
+      size_t idx;
+      if ((size_t)j < nreq && molecule_ids[(size_t)j] == mid) {
+        idx = (size_t)j;
+      }
+      else {
+        std::unordered_map<int, size_t>::const_iterator it = id_to_index.find(mid);
+        if (it == id_to_index.end())
+          meep::abort("MXLSocketSusceptibility received response for unknown molecule_id %d", mid);
+        idx = it->second;
+      }
       amps_au[3 * idx + 0] = mxl_read_f64(rec + 4);
       amps_au[3 * idx + 1] = mxl_read_f64(rec + 12);
       amps_au[3 * idx + 2] = mxl_read_f64(rec + 20);
@@ -425,8 +420,8 @@ public:
     }
 
     if (total_extra) {
-      std::vector<unsigned char> extras(total_extra);
-      recv_all(extras.data(), extras.size());
+      if (result_extras.size() < total_extra) result_extras.resize(total_extra);
+      recv_all(result_extras.data(), total_extra);
     }
     for (size_t i = 0; i < nreq; ++i)
       if (!seen[i])
@@ -436,6 +431,15 @@ public:
 
 private:
   int fd;
+  size_t cached_nreq;
+  const int *cached_molecule_id_data;
+  std::vector<int> cached_molecule_ids;
+  std::unordered_map<int, size_t> id_to_index;
+  std::vector<unsigned char> step_frame;
+  std::vector<unsigned char> result_head;
+  std::vector<unsigned char> result_fixed;
+  std::vector<unsigned char> result_extras;
+  std::vector<char> seen;
 
   static void set_timeout(int sockfd, double timeout) {
     if (timeout <= 0) return;
@@ -451,6 +455,53 @@ private:
       ::close(fd);
       fd = -1;
     }
+  }
+
+  void clear_step_cache() {
+    cached_nreq = 0;
+    cached_molecule_id_data = NULL;
+    cached_molecule_ids.clear();
+    id_to_index.clear();
+    step_frame.clear();
+    result_head.clear();
+    result_fixed.clear();
+    result_extras.clear();
+    seen.clear();
+  }
+
+  void ensure_step_cache(const std::vector<int> &molecule_ids) {
+    const int *molecule_id_data = molecule_ids.empty() ? NULL : &molecule_ids[0];
+    /* The caller builds molecule_ids during susceptibility initialization and
+       then reuses the same vector for every time step of this client. */
+    if (!step_frame.empty() && cached_molecule_id_data == molecule_id_data &&
+        cached_nreq == molecule_ids.size())
+      return;
+
+    cached_molecule_ids = molecule_ids;
+    cached_molecule_id_data = molecule_id_data;
+    cached_nreq = cached_molecule_ids.size();
+    if (cached_nreq > (size_t)mxl_max_molecule_id)
+      meep::abort("MXLSocketSusceptibility request count exceeds int32 protocol range.");
+
+    step_frame.clear();
+    step_frame.reserve(20 + 32 * cached_nreq);
+    append_header(step_frame, "AGGSTEP");
+    mxl_append_i32(step_frame, (int)cached_nreq);
+    mxl_append_i32(step_frame, (int)cached_nreq);
+    step_frame.resize(step_frame.size() + 24 * cached_nreq, 0);
+    for (size_t i = 0; i < cached_nreq; ++i) {
+      mxl_append_i32(step_frame, cached_molecule_ids[i]);
+      mxl_append_i32(step_frame, (int)i);
+    }
+
+    id_to_index.clear();
+    id_to_index.reserve(cached_nreq);
+    for (size_t i = 0; i < cached_nreq; ++i)
+      id_to_index[cached_molecule_ids[i]] = i;
+
+    result_head.assign(16, 0);
+    result_fixed.clear();
+    seen.assign(cached_nreq, 0);
   }
 
   static void append_header(std::vector<unsigned char> &buf, const char *msg) {
