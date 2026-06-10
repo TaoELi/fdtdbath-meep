@@ -2178,6 +2178,11 @@ std::vector<meep::volume> fragment_stats::absorber_vols;
 material_type_list fragment_stats::extra_materials = material_type_list();
 bool fragment_stats::split_chunks_evenly = false;
 bool fragment_stats::eps_averaging = false;
+bool fragment_stats::mxl_balancing = false;
+double fragment_stats::mxl_cost_per_molecule = 5e-5;
+bool fragment_stats::mxl_complex_fields = false;
+
+static constexpr double mxl_socket_cost_scale = 2.0e5;
 
 static geom_box make_box_from_cell(vector3 cell_size) {
   double edgex = cell_size.x / 2;
@@ -2225,7 +2230,8 @@ fragment_stats compute_fragment_stats(
     std::vector<meep::volume> pml_1d_vols_, std::vector<meep::volume> pml_2d_vols_,
     std::vector<meep::volume> pml_3d_vols_, std::vector<meep::volume> absorber_vols_,
     material_type_list extra_materials_, double tol, int maxeval, bool ensure_per,
-    bool eps_averaging) {
+    bool eps_averaging, bool mxl_balancing, double mxl_cost_per_molecule,
+    bool mxl_complex_fields) {
 
   fragment_stats::geom = geom_;
   fragment_stats::dft_data_list = dft_data_list_;
@@ -2235,6 +2241,9 @@ fragment_stats compute_fragment_stats(
   fragment_stats::absorber_vols = absorber_vols_;
   fragment_stats::extra_materials = extra_materials_;
   fragment_stats::eps_averaging = eps_averaging;
+  fragment_stats::mxl_balancing = mxl_balancing;
+  fragment_stats::mxl_cost_per_molecule = mxl_cost_per_molecule;
+  fragment_stats::mxl_complex_fields = mxl_complex_fields;
 
   init_libctl(default_mat, ensure_per, gv, cell_size, cell_center, &geom_);
   geom_box box = make_box_from_cell(cell_size);
@@ -2245,8 +2254,9 @@ fragment_stats compute_fragment_stats(
 
 fragment_stats::fragment_stats(geom_box &bx)
     : num_anisotropic_eps_pixels(0), num_anisotropic_mu_pixels(0), num_nonlinear_pixels(0),
-      num_susceptibility_pixels(0), num_nonzero_conductivity_pixels(0), num_1d_pml_pixels(0),
-      num_2d_pml_pixels(0), num_3d_pml_pixels(0), num_dft_pixels(0), num_pixels_in_box(0), box(bx) {
+      num_susceptibility_pixels(0), num_mxl_socket_molecules(0),
+      num_nonzero_conductivity_pixels(0), num_1d_pml_pixels(0), num_2d_pml_pixels(0),
+      num_3d_pml_pixels(0), num_dft_pixels(0), num_pixels_in_box(0), box(bx) {
 
   num_pixels_in_box = get_pixels_in_box(&bx);
 }
@@ -2396,6 +2406,18 @@ bool fragment_stats::count_nonlinear_pixels(medium_struct *med, size_t pixels) {
 bool fragment_stats::count_susceptibility_pixels(medium_struct *med, size_t pixels) {
   num_susceptibility_pixels += med->E_susceptibilities.size() * pixels;
   num_susceptibility_pixels += med->H_susceptibilities.size() * pixels;
+  for (const susceptibility &susc : med->E_susceptibilities) {
+    if (susc.is_mxl_socket) {
+      num_mxl_socket_molecules +=
+          pixels * ((!susc.mxl_real_field_only && mxl_complex_fields) ? 2 : 1);
+    }
+  }
+  for (const susceptibility &susc : med->H_susceptibilities) {
+    if (susc.is_mxl_socket) {
+      num_mxl_socket_molecules +=
+          pixels * ((!susc.mxl_real_field_only && mxl_complex_fields) ? 2 : 1);
+    }
+  }
   return (med->E_susceptibilities.size() != 0) || (med->H_susceptibilities.size() != 0);
 }
 
@@ -2481,7 +2503,10 @@ double fragment_stats::cost() const {
           num_nonlinear_pixels * 1.67029547e-04 + num_susceptibility_pixels * 2.24790864e-04 +
           num_nonzero_conductivity_pixels * 4.61260934e-05 + num_dft_pixels * 1.47283950e-04 +
           num_1d_pml_pixels * 9.92955372e-05 + num_2d_pml_pixels * 1.36901107e-03 +
-          num_3d_pml_pixels * 6.63939607e-04 + num_pixels_in_box * 3.46518274e-04);
+          num_3d_pml_pixels * 6.63939607e-04 + num_pixels_in_box * 3.46518274e-04 +
+          (mxl_balancing ? num_mxl_socket_molecules * mxl_cost_per_molecule *
+                               mxl_socket_cost_scale
+                         : 0.0));
 }
 
 void fragment_stats::print_stats() const {
@@ -2490,6 +2515,7 @@ void fragment_stats::print_stats() const {
   master_printf("  anisotropic_mu: %zu\n", num_anisotropic_mu_pixels);
   master_printf("  nonlinear: %zu\n", num_nonlinear_pixels);
   master_printf("  susceptibility: %zu\n", num_susceptibility_pixels);
+  master_printf("  mxl_socket_molecules: %zu\n", num_mxl_socket_molecules);
   master_printf("  conductivity: %zu\n", num_nonzero_conductivity_pixels);
   master_printf("  pml_1d: %zu\n", num_1d_pml_pixels);
   master_printf("  pml_2d: %zu\n", num_2d_pml_pixels);

@@ -343,9 +343,11 @@ protected:
 };
 
 /* Socket-backed MaxwellLink molecular susceptibility.  Each active Yee-grid
-   site is coupled to one external MaxwellLink molecule and the returned
-   dmu/dt is integrated into the local polarization density.  The sigma arrays
-   are used only to select active grid points and tensor components. */
+   site is coupled to one external MaxwellLink molecule.  The rescaling_factor
+   is a bright-state coupling scale applied both to the electric field sent to
+   the molecule and to the returned dmu/dt when converting to polarization
+   density.  The sigma arrays are used only to select active grid points and
+   tensor components. */
 class mxl_socket_susceptibility : public susceptibility {
 public:
   mxl_socket_susceptibility(realnum rescaling_factor = 1.0, realnum time_units_fs = 0.1,

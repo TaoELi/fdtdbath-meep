@@ -224,10 +224,11 @@ static int mxl_dim_power(ndim dim) {
     case D1: return 1;
     case D2: return 2;
     case D3: return 3;
-    /* MXLSocketSusceptibility keeps rescaling_factor tied to the
+    /* The local polarization-density update remains normalized by the
        equivalent 3d Cartesian Yee-cell volume.  Cylindrical annular
        integration weights belong in global integrals, not in the local
-       polarization-density update. */
+       polarization-density update; rescaling_factor is a symmetric
+       bright-state coupling scale applied to drive and response. */
     case Dcyl: return 3;
   }
   return 3;
@@ -1314,7 +1315,8 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
   mxl_socket_data *d = (mxl_socket_data *)P_internal_data;
   if (!d || d->active_indices.empty() || rescaling_factor == 0.0) return;
 
-  const double efield_factor = mxl_efield_mu_to_au_prefactor / (time_units_fs * time_units_fs);
+  const double efield_factor =
+      mxl_efield_mu_to_au_prefactor * rescaling_factor / (time_units_fs * time_units_fs);
   const size_t nsites = d->active_indices.size();
 
   component comps[3];

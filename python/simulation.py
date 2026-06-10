@@ -28,6 +28,7 @@ from meep.geom import (
     Medium,
     MXLSocketSusceptibility,
     Vector3,
+    check_nonnegative,
     init_do_averaging,
 )
 from meep.source import (
@@ -1261,6 +1262,8 @@ class Simulation:
         geometry_center: Vector3Type = Vector3(),
         force_all_components: bool = False,
         split_chunks_evenly: bool = True,
+        mxl_balancing: bool = False,
+        mxl_cost_per_molecule: float = 5e-5,
         chunk_layout=None,
         collect_stats: bool = False,
     ):
@@ -1492,7 +1495,19 @@ class Simulation:
           the exception of PML regions, which must be on their own chunk). When `False`,
           Meep attempts to allocate an equal amount of work to each processor, which can
           increase the performance of [parallel simulations](Parallel_Meep.md).
+
+        + **`mxl_balancing` [ `boolean` ]** — When `True`, initial automatic chunk
+          partitioning includes the estimated per-timestep socket communication cost of
+          `MXLSocketSusceptibility` molecules. This uses the cost-based partitioner
+          internally, as if `split_chunks_evenly` were `False`. Explicit `chunk_layout`
+          inputs still take precedence. Default is `False`.
+
+        + **`mxl_cost_per_molecule` [ `number` ]** — Estimated wall-clock socket
+          communication cost in seconds per socket molecule per timestep for
+          `mxl_balancing`. Default is 5e-5.
         """
+
+        check_nonnegative("mxl_cost_per_molecule", mxl_cost_per_molecule)
 
         self.cell_size = Vector3(*cell_size)
         self.geometry = geometry if geometry else []
@@ -1545,6 +1560,8 @@ class Simulation:
         self._is_initialized = False
         self.force_all_components = force_all_components
         self.split_chunks_evenly = split_chunks_evenly
+        self.mxl_balancing = mxl_balancing
+        self.mxl_cost_per_molecule = mxl_cost_per_molecule
         self.chunk_layout = chunk_layout
         self._chunk_layout_original = self.chunk_layout
         self.collect_stats = collect_stats
@@ -2010,6 +2027,9 @@ class Simulation:
             self.subpixel_maxeval,
             self.ensure_periodicity,
             self.eps_averaging,
+            self.mxl_balancing,
+            self.mxl_cost_per_molecule,
+            self._mxl_complex_fields(),
         )
 
         mirror_symmetries = [sym for sym in self.symmetries if isinstance(sym, Mirror)]
@@ -2018,6 +2038,7 @@ class Simulation:
             stats.num_anisotropic_mu_pixels //= 2
             stats.num_nonlinear_pixels //= 2
             stats.num_susceptibility_pixels //= 2
+            stats.num_mxl_socket_molecules //= 2
             stats.num_nonzero_conductivity_pixels //= 2
             stats.num_1d_pml_pixels //= 2
             stats.num_2d_pml_pixels //= 2
@@ -2100,7 +2121,10 @@ class Simulation:
             self.default_material,
             absorbers,
             self.extra_materials,
-            self.split_chunks_evenly,
+            self._effective_split_chunks_evenly(),
+            self.mxl_balancing,
+            self.mxl_cost_per_molecule,
+            self._mxl_complex_fields(),
             False
             if self.chunk_layout
             and not isinstance(self.chunk_layout, mp.BinaryPartition)
@@ -2124,7 +2148,10 @@ class Simulation:
             self.default_material,
             absorbers,
             self.extra_materials,
-            self.split_chunks_evenly,
+            self._effective_split_chunks_evenly(),
+            self.mxl_balancing,
+            self.mxl_cost_per_molecule,
+            self._mxl_complex_fields(),
             True,
             None,
             False,
@@ -2303,7 +2330,10 @@ class Simulation:
             default_material if default_material else self.default_material,
             absorbers,
             self.extra_materials,
-            self.split_chunks_evenly,
+            self._effective_split_chunks_evenly(),
+            self.mxl_balancing,
+            self.mxl_cost_per_molecule,
+            self._mxl_complex_fields(),
             True,
             self.structure,
             False,
@@ -2322,7 +2352,10 @@ class Simulation:
             default_material if default_material else self.default_material,
             absorbers,
             self.extra_materials,
-            self.split_chunks_evenly,
+            self._effective_split_chunks_evenly(),
+            self.mxl_balancing,
+            self.mxl_cost_per_molecule,
+            self._mxl_complex_fields(),
             True,
             None,
             False,
@@ -2555,6 +2588,14 @@ class Simulation:
         cond4 = self.special_kz and self.k_point.x == 0 and self.k_point.y == 0
         cond5 = not (cond3 or cond4 or self.k_point == Vector3())
         return not (self.force_complex_fields or cond1 or cond2 or cond5)
+
+    def _effective_split_chunks_evenly(self):
+        return False if self.mxl_balancing else self.split_chunks_evenly
+
+    def _mxl_complex_fields(self):
+        if self.fields:
+            return not self.fields.is_real
+        return not self.using_real_fields()
 
     def initialize_field(
         self,

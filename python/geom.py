@@ -1072,12 +1072,12 @@ class MXLSocketSusceptibility(Susceptibility):
     """
     Specifies a socket-backed MaxwellLink molecular susceptibility.
 
-    This C-level susceptibility sends the local Meep electric field at each
-    active grid point to a MaxwellLink socket endpoint and deposits the returned
-    molecular `dmu/dt` as a polarization-density update. The endpoint is
-    normally supplied as a MaxwellLink hub object. The geometry region is
-    selected through normal Meep material assignment; this class intentionally
-    does not expose a public `sigma` parameter.
+    This C-level susceptibility sends the rescaling-factor-scaled local Meep
+    electric field at each active grid point to a MaxwellLink socket endpoint
+    and deposits the returned molecular `dmu/dt` as a polarization-density
+    update. The endpoint is normally supplied as a MaxwellLink hub object. The
+    geometry region is selected through normal Meep material assignment; this
+    class intentionally does not expose a public `sigma` parameter.
     """
 
     def __init__(
@@ -1091,8 +1091,11 @@ class MXLSocketSusceptibility(Susceptibility):
         real_field_only=True,
     ):
         """
-        + **`rescaling_factor` [`number`]** — The effective number of physical
-          molecules represented by one socket molecule at each active grid point.
+        + **`rescaling_factor` [`number`]** — Bright-state coupling scale
+          applied both to the electric field sent to the socket molecule and to
+          the returned molecular `dmu/dt` when converting to Meep
+          polarization-current density. To reproduce a previous density/current
+          scale N in the linear-response limit, pass sqrt(N).
 
         + **`time_units_fs` [`number`]** — The number of femtoseconds represented
           by one Meep time unit.

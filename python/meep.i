@@ -1941,6 +1941,9 @@ meep::structure *create_structure(vector3 cell_size,
                                     meep_geom::absorber_list alist,
                                     meep_geom::material_type_list extra_materials,
                                     bool split_chunks_evenly,
+                                    bool mxl_balancing,
+                                    double mxl_cost_per_molecule,
+                                    bool mxl_complex_fields,
                                     bool set_materials,
                                     meep::structure *existing_s,
                                     bool output_chunk_costs,
@@ -1957,6 +1960,9 @@ meep::structure *create_structure(vector3 cell_size,
     meep_geom::fragment_stats::resolution = gv.a;
     meep_geom::fragment_stats::dims = gv.dim;
     meep_geom::fragment_stats::split_chunks_evenly = split_chunks_evenly;
+    meep_geom::fragment_stats::mxl_balancing = mxl_balancing;
+    meep_geom::fragment_stats::mxl_cost_per_molecule = mxl_cost_per_molecule;
+    meep_geom::fragment_stats::mxl_complex_fields = mxl_complex_fields;
     meep_geom::init_libctl(_default_material, _ensure_periodicity,
                            &gv, cell_size, center, &gobj_list);
 
@@ -1997,12 +2003,18 @@ meep_geom::geom_epsilon* _set_materials(meep::structure * s,
                     meep_geom::absorber_list alist,
                     meep_geom::material_type_list extra_materials,
                     bool split_chunks_evenly,
+                    bool mxl_balancing,
+                    double mxl_cost_per_molecule,
+                    bool mxl_complex_fields,
                     bool set_materials,
                     meep_geom::geom_epsilon *existing_geps,
                     bool output_chunk_costs,
                     const meep::binary_partition *my_bp) {
 
     meep_geom::geom_epsilon *geps;
+    meep_geom::fragment_stats::mxl_balancing = mxl_balancing;
+    meep_geom::fragment_stats::mxl_cost_per_molecule = mxl_cost_per_molecule;
+    meep_geom::fragment_stats::mxl_complex_fields = mxl_complex_fields;
     if (existing_geps) {
         geps = existing_geps;
     } else {
@@ -2039,6 +2051,9 @@ meep_geom::geom_epsilon* _set_materials(meep::structure * s,
     // Return params to default state
     meep_geom::fragment_stats::resolution = 0;
     meep_geom::fragment_stats::split_chunks_evenly = false;
+    meep_geom::fragment_stats::mxl_balancing = false;
+    meep_geom::fragment_stats::mxl_cost_per_molecule = 5e-5;
+    meep_geom::fragment_stats::mxl_complex_fields = false;
 
     return geps;
 }

@@ -70,6 +70,9 @@ struct fragment_stats {
   static material_type_list extra_materials;
   static bool split_chunks_evenly;
   static bool eps_averaging;
+  static bool mxl_balancing;
+  static double mxl_cost_per_molecule;
+  static bool mxl_complex_fields;
 
   static bool has_non_medium_material();
 
@@ -77,6 +80,7 @@ struct fragment_stats {
   size_t num_anisotropic_mu_pixels;
   size_t num_nonlinear_pixels;
   size_t num_susceptibility_pixels;
+  size_t num_mxl_socket_molecules;
   size_t num_nonzero_conductivity_pixels;
 
   // Pixels in single PML regions
@@ -117,7 +121,8 @@ compute_fragment_stats(geometric_object_list geom, meep::grid_volume *gv, vector
                        std::vector<dft_data> dft_data_list, std::vector<meep::volume> pml_1d_vols,
                        std::vector<meep::volume> pml_2d_vols, std::vector<meep::volume> pml_3d_vols,
                        std::vector<meep::volume> absorber_vols, material_type_list extra_materials,
-                       double tol, int maxeval, bool ensure_per, bool eps_averaging);
+                       double tol, int maxeval, bool ensure_per, bool eps_averaging,
+                       bool mxl_balancing, double mxl_cost_per_molecule, bool mxl_complex_fields);
 
 /***************************************************************/
 /* these routines create and append absorbing layers to an     */
