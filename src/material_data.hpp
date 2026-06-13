@@ -75,6 +75,7 @@ typedef struct susceptibility_struct {
   double mxl_timeout;
   std::string mxl_host;
   int mxl_port;
+  std::string mxl_label;
   bool mxl_real_field_only;
 } susceptibility;
 

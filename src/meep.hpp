@@ -352,7 +352,8 @@ class mxl_socket_susceptibility : public susceptibility {
 public:
   mxl_socket_susceptibility(realnum rescaling_factor = 1.0, realnum time_units_fs = 0.1,
                             realnum timeout = 60000.0, const char *host = "127.0.0.1",
-                            int port = 31415, bool real_field_only = true);
+                            int port = 31415, const char *label = "",
+                            bool real_field_only = true);
   virtual susceptibility *clone() const { return new mxl_socket_susceptibility(*this); }
   virtual ~mxl_socket_susceptibility() {}
 
@@ -393,6 +394,7 @@ protected:
   realnum timeout;
   std::string host;
   int port;
+  std::string label;
   bool real_field_only;
 };
 

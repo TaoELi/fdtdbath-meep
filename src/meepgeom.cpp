@@ -64,6 +64,7 @@ bool susceptibility_equal(const susceptibility &s1, const susceptibility &s2) {
           s1.mxl_rescaling_factor == s2.mxl_rescaling_factor &&
           s1.mxl_time_units_fs == s2.mxl_time_units_fs && s1.mxl_timeout == s2.mxl_timeout &&
           s1.mxl_host == s2.mxl_host && s1.mxl_port == s2.mxl_port &&
+          s1.mxl_label == s2.mxl_label &&
           s1.mxl_real_field_only == s2.mxl_real_field_only);
 }
 
@@ -1654,6 +1655,7 @@ static bool susceptibility_equiv(const susceptibility &o0, const susceptibility 
   if (o0.mxl_timeout != o.mxl_timeout) return false;
   if (o0.mxl_host != o.mxl_host) return false;
   if (o0.mxl_port != o.mxl_port) return false;
+  if (o0.mxl_label != o.mxl_label) return false;
   if (o0.mxl_real_field_only != o.mxl_real_field_only) return false;
 
   if (o0.transitions != o.transitions) return false;
@@ -1861,12 +1863,13 @@ void geom_epsilon::add_susceptibilities(meep::field_type ft, meep::structure *s)
         meep::abort("MXLSocketSusceptibility currently supports only E_susceptibilities.");
       sus = new meep::mxl_socket_susceptibility(ss->mxl_rescaling_factor, ss->mxl_time_units_fs,
                                                 ss->mxl_timeout, ss->mxl_host.c_str(),
-                                                ss->mxl_port, ss->mxl_real_field_only);
+                                                ss->mxl_port, ss->mxl_label.c_str(),
+                                                ss->mxl_real_field_only);
       if (meep::verbosity > 0) {
         master_printf("MaxwellLink socket susceptibility: host=%s, port=%d, rescaling_factor=%g, "
-                      "real_field_only=%s\n",
+                      "label=%s, real_field_only=%s\n",
                       ss->mxl_host.c_str(), ss->mxl_port, ss->mxl_rescaling_factor,
-                      ss->mxl_real_field_only ? "true" : "false");
+                      ss->mxl_label.c_str(), ss->mxl_real_field_only ? "true" : "false");
       }
     }
     else if (ss->transitions.size() != 0 || ss->initial_populations.size() != 0) {

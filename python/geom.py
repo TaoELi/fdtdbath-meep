@@ -1084,10 +1084,9 @@ class MXLSocketSusceptibility(Susceptibility):
         self,
         rescaling_factor=1.0,
         time_units_fs=0.1,
-        hub=None,
-        timeout=None,
-        host=None,
-        port=None,
+        *,
+        hub,
+        label="",
         real_field_only=True,
     ):
         """
@@ -1100,14 +1099,12 @@ class MXLSocketSusceptibility(Susceptibility):
         + **`time_units_fs` [`number`]** — The number of femtoseconds represented
           by one Meep time unit.
 
-        + **`hub`** — Optional MaxwellLink susceptibility socket hub. If omitted,
-          the explicit `host`, `port`, and `timeout` values are used.
+        + **`hub`** — MaxwellLink susceptibility socket hub. The hub provides
+          the host, port, and timeout used by the internal socket connection.
 
-        + **`timeout` [`number`]** — Socket timeout in seconds.
-
-        + **`host` [`string`]** — MaxwellLink hub host name or IP address.
-
-        + **`port` [`integer`]** — MaxwellLink hub TCP port.
+        + **`label` [`string`]** — Optional Meep-side label used in the
+          molecule map output and material equivalence checks. This value is
+          not sent to MaxwellLink.
 
         + **`real_field_only` [`boolean`]** — If true, socket molecules are
           driven only by the real electric field component. If false, complex
@@ -1120,7 +1117,58 @@ class MXLSocketSusceptibility(Susceptibility):
         # The scalar sigma marks material pixels as active for the C++ socket
         # susceptibility; it is not a Lorentzian oscillator strength.
         super().__init__(sigma=1.0)
-        host, port, timeout = self._resolve_hub_endpoint(hub, host, port, timeout)
+        if hub is None:
+            raise ValueError(
+                "MXLSocketSusceptibility requires a MaxwellLink susceptibility socket hub."
+            )
+        try:
+            host, port, timeout = hub.host, hub.port, hub.timeout
+        except AttributeError as exc:
+            raise ValueError("hub must provide host, port, and timeout attributes.") from exc
+        self._init_resolved_endpoint(
+            rescaling_factor,
+            time_units_fs,
+            timeout,
+            host,
+            port,
+            label,
+            real_field_only,
+        )
+
+    @classmethod
+    def _from_resolved_endpoint(
+        cls,
+        rescaling_factor=1.0,
+        time_units_fs=0.1,
+        timeout=60000.0,
+        host="127.0.0.1",
+        port=31415,
+        label="",
+        real_field_only=True,
+    ):
+        self = cls.__new__(cls)
+        Susceptibility.__init__(self, sigma=1.0)
+        self._init_resolved_endpoint(
+            rescaling_factor,
+            time_units_fs,
+            timeout,
+            host,
+            port,
+            label,
+            real_field_only,
+        )
+        return self
+
+    def _init_resolved_endpoint(
+        self,
+        rescaling_factor,
+        time_units_fs,
+        timeout,
+        host,
+        port,
+        label,
+        real_field_only,
+    ):
         check_nonnegative("rescaling_factor", rescaling_factor)
         check_nonnegative("timeout", timeout)
         if time_units_fs <= 0:
@@ -1129,6 +1177,10 @@ class MXLSocketSusceptibility(Susceptibility):
             raise ValueError("host must be a nonempty string.")
         if port <= 0 or port > 65535:
             raise ValueError("port must be in the range [1, 65535].")
+        if not isinstance(label, str):
+            raise ValueError("label must be a string.")
+        if "\n" in label or "\r" in label:
+            raise ValueError("label must not contain a newline.")
         if not isinstance(real_field_only, (bool, np.bool_)):
             raise ValueError("real_field_only must be a boolean.")
         self.rescaling_factor = rescaling_factor
@@ -1136,19 +1188,8 @@ class MXLSocketSusceptibility(Susceptibility):
         self.timeout = timeout
         self.host = host
         self.port = port
+        self.label = label
         self.real_field_only = bool(real_field_only)
-
-    @staticmethod
-    def _resolve_hub_endpoint(hub, host, port, timeout):
-        if hub is None:
-            return (
-                "127.0.0.1" if host is None else host,
-                31415 if port is None else port,
-                60000.0 if timeout is None else timeout,
-            )
-        if any(x is not None for x in (host, port, timeout)):
-            raise ValueError("Specify either hub or explicit host/port/timeout, not both.")
-        return hub.host, hub.port, hub.timeout
 
     def eval_susceptibility(self, freq):
         return np.zeros((np.asarray(freq).size, 3, 3), dtype=complex)

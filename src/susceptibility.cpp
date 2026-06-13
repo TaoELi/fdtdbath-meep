@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <numeric>
 #include <sstream>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -210,6 +211,7 @@ const double mxl_source_amp_au_to_mu = 0.002209799779149953;
 const int mxl_molecules_per_chunk_id_block = 100000;
 const int mxl_chunks_per_rank_id_block = 100;
 const int mxl_max_molecule_id = 2147483647;
+const char *mxl_socket_mapping_filename = "mxl_socket_molecule_map.csv";
 
 /* These counters are reset whenever material susceptibilities are rebuilt. */
 int mxl_next_chunk_ordinal = 0;
@@ -219,6 +221,22 @@ size_t mxl_expected_total_required_driver_count = 0;
 bool mxl_socket_susceptibility_present = false;
 bool mxl_driver_count_reported = false;
 bool mxl_socket_imag_field_coupling_active = false;
+
+struct mxl_socket_mapping_record {
+  int molecule_id;
+  int chunk_ordinal;
+  int drive_cmp;
+  size_t site_ordinal;
+  size_t local_index;
+  double x_or_r;
+  double y;
+  double z;
+  std::string label;
+  std::string host;
+  int port;
+};
+
+std::vector<mxl_socket_mapping_record> mxl_local_mapping_records;
 
 static int mxl_dim_power(ndim dim) {
   switch (dim) {
@@ -288,6 +306,59 @@ static double mxl_read_f64(const unsigned char *p) {
   double value;
   memcpy(&value, p, sizeof(double));
   return value;
+}
+
+static double mxl_x_or_r(const vec &r) {
+  if (r.dim == Dcyl) return r.in_direction(R);
+  return has_direction(r.dim, X) ? r.in_direction(X) : 0.0;
+}
+
+static double mxl_y(const vec &r) { return has_direction(r.dim, Y) ? r.in_direction(Y) : 0.0; }
+
+static double mxl_z(const vec &r) { return has_direction(r.dim, Z) ? r.in_direction(Z) : 0.0; }
+
+static void mxl_fprint_csv_string(FILE *f, const std::string &s) {
+  fputc('"', f);
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '"') fputc('"', f);
+    fputc(s[i], f);
+  }
+  fputc('"', f);
+}
+
+static void mxl_write_mapping_csv() {
+  begin_critical_section(31416);
+
+  FILE *f = fopen(mxl_socket_mapping_filename, my_rank() == 0 ? "w" : "a");
+  if (!f)
+    meep::abort("MXLSocketSusceptibility failed to open molecule map '%s' for writing: %s",
+                mxl_socket_mapping_filename, strerror(errno));
+
+  if (my_rank() == 0) {
+    fprintf(f, "molecule_id,rank,chunk_ordinal,label,host,port,drive_cmp,drive_part,"
+               "site_ordinal,local_index,x_or_r,y,z\n");
+  }
+
+  for (size_t i = 0; i < mxl_local_mapping_records.size(); ++i) {
+    const mxl_socket_mapping_record &r = mxl_local_mapping_records[i];
+    fprintf(f, "%d,%d,%d,", r.molecule_id, my_rank(), r.chunk_ordinal);
+    mxl_fprint_csv_string(f, r.label);
+    fprintf(f, ",");
+    mxl_fprint_csv_string(f, r.host);
+    fprintf(f, ",%d,%d,%s,%zu,%zu,%.17g,%.17g,%.17g\n", r.port, r.drive_cmp,
+            r.drive_cmp == 0 ? "real" : "imag", r.site_ordinal, r.local_index, r.x_or_r, r.y,
+            r.z);
+  }
+
+  if (fclose(f) != 0)
+    meep::abort("MXLSocketSusceptibility failed to close molecule map '%s': %s",
+                mxl_socket_mapping_filename, strerror(errno));
+
+  end_critical_section(31416);
+  all_wait();
+
+  master_printf("MXLSocketSusceptibility molecule map written to %s\n",
+                mxl_socket_mapping_filename);
 }
 
 /* Minimal TCP client for the aggregate MaxwellLink susceptibility protocol. */
@@ -600,6 +671,7 @@ void reset_mxl_socket_susceptibility_chunk_ordinals() {
   mxl_local_active_site_count = 0;
   mxl_local_required_driver_count = 0;
   mxl_expected_total_required_driver_count = 0;
+  mxl_local_mapping_records.clear();
   mxl_socket_susceptibility_present = false;
   mxl_driver_count_reported = false;
   mxl_socket_imag_field_coupling_active = false;
@@ -635,6 +707,7 @@ void report_mxl_socket_susceptibility_driver_count(field_type ft) {
                   "independent socket molecules are used for real and imaginary E-field "
                   "components, so required socket drivers are doubled relative to active "
                   "grid points.\n");
+  if (total_required_driver_count > 0) mxl_write_mapping_csv();
   mxl_driver_count_reported = true;
 }
 
@@ -1231,9 +1304,11 @@ void bath_lorentzian_susceptibility::dump_params(h5file *h5f, size_t *start) {
 mxl_socket_susceptibility::mxl_socket_susceptibility(realnum rescaling_factor,
                                                      realnum time_units_fs, realnum timeout,
                                                      const char *host, int port,
+                                                     const char *label,
                                                      bool real_field_only)
     : rescaling_factor(rescaling_factor), time_units_fs(time_units_fs), timeout(timeout),
-      host(host ? host : "127.0.0.1"), port(port), real_field_only(real_field_only) {
+      host(host ? host : "127.0.0.1"), port(port), label(label ? label : ""),
+      real_field_only(real_field_only) {
   mxl_socket_susceptibility_present = true;
   mxl_assert_little_endian();
   if (rescaling_factor < 0.0)
@@ -1244,6 +1319,9 @@ mxl_socket_susceptibility::mxl_socket_susceptibility(realnum rescaling_factor,
   if (this->host.empty()) meep::abort("MXLSocketSusceptibility host must be nonempty.");
   if (port <= 0 || port > 65535)
     meep::abort("MXLSocketSusceptibility port must be in the range [1, 65535].");
+  if (this->label.find('\n') != std::string::npos ||
+      this->label.find('\r') != std::string::npos)
+    meep::abort("MXLSocketSusceptibility label must not contain a newline.");
 }
 
 bool mxl_socket_susceptibility::needs_P(component c, int cmp,
@@ -1342,6 +1420,29 @@ void mxl_socket_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONEN
   d->molecule_ids.resize(required_driver_count);
   for (size_t i = 0; i < d->molecule_ids.size(); ++i)
     d->molecule_ids[i] = base_id + (int)i;
+
+  mxl_local_mapping_records.reserve(mxl_local_mapping_records.size() + required_driver_count);
+  for (size_t icmp = 0; icmp < d->drive_cmps.size(); ++icmp) {
+    int cmp = d->drive_cmps[icmp];
+    for (size_t isite = 0; isite < d->active_indices.size(); ++isite) {
+      size_t imol = icmp * d->active_indices.size() + isite;
+      size_t idx = d->active_indices[isite];
+      vec r = gv.loc(Centered, (ptrdiff_t)idx);
+      mxl_socket_mapping_record rec;
+      rec.molecule_id = d->molecule_ids[imol];
+      rec.chunk_ordinal = chunk_ordinal;
+      rec.drive_cmp = cmp;
+      rec.site_ordinal = isite;
+      rec.local_index = idx;
+      rec.x_or_r = mxl_x_or_r(r);
+      rec.y = mxl_y(r);
+      rec.z = mxl_z(r);
+      rec.label = label;
+      rec.host = host;
+      rec.port = port;
+      mxl_local_mapping_records.push_back(rec);
+    }
+  }
 
   mxl_local_active_site_count += d->active_indices.size();
   mxl_local_required_driver_count += required_driver_count;
