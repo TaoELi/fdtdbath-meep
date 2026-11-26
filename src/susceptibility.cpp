@@ -1482,6 +1482,15 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
   const double efield_factor =
       mxl_efield_mu_to_au_prefactor * rescaling_factor / (time_units_fs * time_units_fs);
   const size_t nsites = d->active_indices.size();
+  auto coordinate_scale = [&](component c, size_t idx) {
+    if (gv.dim != Dcyl)
+      return 1.0; // No extra weighting in Cartesian coordinates.
+    const double radius = gv.loc(c, (ptrdiff_t)idx).r();
+    const double spacing = gv.inva;
+    if (radius <= 0.0)
+      meep::abort("Cylindrical weighting requires positive radius.");
+    return sqrt(M_PI * radius / spacing);
+  };
 
   component comps[3];
   mxl_field_components(gv.dim, comps);
@@ -1494,7 +1503,7 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
         component c = comps[axis];
         d->efields_au[3 * imol + axis] =
             ((d->comp_mask[isite] & (1 << axis)) && W[c][cmp])
-                ? efield_factor * W[c][cmp][idx]
+                ? efield_factor * coordinate_scale(c, idx) * W[c][cmp][idx]
                 : 0.0;
       }
     }
@@ -1530,7 +1539,7 @@ void mxl_socket_susceptibility::update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
         size_t imol = icmp * nsites + isite;
         size_t idx = d->active_indices[isite];
         if (d->comp_mask[isite] & (1 << axis))
-          p[idx] += (realnum)(dt * pdot_scale * s[idx] * d->amps_au[3 * imol + axis]);
+          p[idx] += (realnum)(dt * pdot_scale * s[idx] * d->amps_au[3 * imol + axis] / coordinate_scale(c, idx));
       }
     }
   }
